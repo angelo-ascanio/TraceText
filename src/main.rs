@@ -22,7 +22,9 @@ pub struct QueryMatch {
     pub matches: bool,
     pub location: StructuralLocation,
     pub similarity_score: f32,
-    pub raw_matched_text: CompactString,
+    pub prefix: CompactString,
+    pub match_text: CompactString,
+    pub suffix: CompactString,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -41,7 +43,7 @@ pub enum StructuralLocation {
 #[derive(Debug, Clone)]
 pub struct TextCandidate {
     pub text: String,
-    pub normalized_text: String, // NEW: Cache normalized text to prevent CPU thrashing
+    pub normalized_text: String, 
     pub location: StructuralLocation,
 }
 
@@ -54,7 +56,6 @@ impl DocumentExtractor {
 
         parser.for_each_page(PageStreamOptions::default(), |event| {
             if let ParseEvent::PageParsed(page) = event {
-                // NEW: Page-local batching to eliminate O(N) lock contention
                 let mut page_candidates = Vec::new(); 
                 
                 for (elem_idx, element) in page.elements.iter().enumerate() {
@@ -76,7 +77,6 @@ impl DocumentExtractor {
                     }
                 }
 
-                // Append batch using a single mutex lock per page
                 if !page_candidates.is_empty() {
                     candidates_accumulator.lock().unwrap().extend(page_candidates);
                 }
@@ -149,20 +149,17 @@ impl StructuralSearchEngine {
         let mut normalized_queries = Vec::with_capacity(queries.len());
         let mut perfect_scores = Vec::with_capacity(queries.len());
         
-        // FIX 1: Config::default() -> Config::DEFAULT
         let mut matcher = Matcher::new(Config::DEFAULT);
 
         for query in &queries {
             let normalized = Self::normalize_text(query.as_str());
             
-            // Pre-calculate perfect score
             let pattern = Pattern::parse(
                 &normalized, 
                 CaseMatching::Respect, 
                 Normalization::Never
             );
             
-            // FIX 2: Added utf-32 conversion prior to invoking score() instead of match_str()
             let utf32_normalized = nucleo_matcher::Utf32String::from(normalized.as_str());
             let perfect_score = pattern.score(utf32_normalized.slice(..), &mut matcher)
                 .map(|score| score as f32)
@@ -190,15 +187,12 @@ impl StructuralSearchEngine {
 
     pub fn filter_candidates<'a>(&self, candidates: &'a [TextCandidate]) -> Vec<&'a TextCandidate> {
         let Some(ac) = &self.aho_corasick else { return candidates.iter().collect(); };
-        // Evaluate strictly against the normalized text to prevent false negative discards
         candidates.iter().filter(|cand| ac.is_match(&cand.normalized_text)).collect()
     }
 
-    pub fn process_candidates(&self, candidates: &[&TextCandidate], threshold: f32) -> Vec<QueryMatch> {
-        // Use thread-local Matcher to avoid matrix reallocation overhead
+    pub fn process_candidates(&self, candidates: &[&TextCandidate], threshold: f32, buffer_size: usize) -> Vec<QueryMatch> {
         thread_local! {
             static THREAD_MATCHER: std::cell::RefCell<Matcher> = 
-                // FIX 1: Config::default() -> Config::DEFAULT
                 std::cell::RefCell::new(Matcher::new(Config::DEFAULT));
         }
 
@@ -214,30 +208,35 @@ impl StructuralSearchEngine {
 
                     // STEP 1: Contiguous Substring Validation -> Exact 100.0
                     if let Some(byte_idx) = candidate.normalized_text.find(norm_query) {
-                        // Convert the byte index to a character index to align with candidate.text.chars()
                         let start_idx = candidate.normalized_text[..byte_idx].chars().count();
                         let query_len = norm_query.chars().count();
                         
-                        let buffer = 40;
-                        let snippet_start = start_idx.saturating_sub(buffer);
-                        let snippet_len = query_len + (buffer * 2);
+                        let snippet_start = start_idx.saturating_sub(buffer_size);
+                        let total_chars = candidate.text.chars().count();
 
-                        // Extract snippet centered perfectly around the exact match
-                        let mut snippet: String = candidate.text.chars().skip(snippet_start).take(snippet_len).collect();
-                        if snippet_start > 0 { snippet.insert_str(0, "..."); }
-                        if snippet_start + snippet_len < candidate.text.chars().count() { snippet.push_str("..."); }
+                        let prefix_len = start_idx - snippet_start;
+                        let mut prefix: String = candidate.text.chars().skip(snippet_start).take(prefix_len).collect();
+                        if snippet_start > 0 { prefix.insert_str(0, "..."); }
+
+                        let match_text: String = candidate.text.chars().skip(start_idx).take(query_len).collect();
+
+                        let suffix_start = start_idx + query_len;
+                        let mut suffix: String = candidate.text.chars().skip(suffix_start).take(buffer_size).collect();
+                        if suffix_start + buffer_size < total_chars { suffix.push_str("..."); }
 
                         local_results.push(QueryMatch {
                             query: query.clone(),
                             matches: true,
                             location: candidate.location.clone(),
                             similarity_score: 100.0,
-                            raw_matched_text: CompactString::from(snippet.trim()),
+                            prefix: CompactString::from(prefix.trim_start()),
+                            match_text: CompactString::from(match_text),
+                            suffix: CompactString::from(suffix.trim_end()),
                         });
                         continue;
                     }
 
-                    // STEP 2 & 3: Fuzzy Sequence Alignment & Bounded Scaling
+                    // STEP 2 & 3: Fuzzy Sequence Alignment
                     let pattern = Pattern::parse(
                         norm_query, 
                         CaseMatching::Respect, 
@@ -255,28 +254,33 @@ impl StructuralSearchEngine {
                         let match_span = end_idx.saturating_sub(start_idx) + 1;
                         let query_len = norm_query.chars().count();
 
-                        // Structural Length Guard: Reject if match spans too large of a gap
                         if match_span as f32 > (query_len as f32 * 2.5) { continue; }
 
-                        // Scale dynamically and apply 99.0 ceiling
                         let scaled_score = (raw_score as f32 / perfect_score) * 99.0;
                         let normalized_score = scaled_score.min(99.0);
 
                         if normalized_score >= threshold {
-                            let buffer = 40;
-                            let snippet_start = start_idx.saturating_sub(buffer);
-                            let snippet_len = match_span + (buffer * 2);
+                            let snippet_start = start_idx.saturating_sub(buffer_size);
+                            let total_chars = candidate.text.chars().count();
 
-                            let mut snippet: String = candidate.text.chars().skip(snippet_start).take(snippet_len).collect();
-                            if snippet_start > 0 { snippet.insert_str(0, "..."); }
-                            if snippet_start + snippet_len < candidate.text.chars().count() { snippet.push_str("..."); }
+                            let prefix_len = start_idx - snippet_start;
+                            let mut prefix: String = candidate.text.chars().skip(snippet_start).take(prefix_len).collect();
+                            if snippet_start > 0 { prefix.insert_str(0, "..."); }
+
+                            let match_text: String = candidate.text.chars().skip(start_idx).take(match_span).collect();
+
+                            let suffix_start = start_idx + match_span;
+                            let mut suffix: String = candidate.text.chars().skip(suffix_start).take(buffer_size).collect();
+                            if suffix_start + buffer_size < total_chars { suffix.push_str("..."); }
 
                             local_results.push(QueryMatch {
                                 query: query.clone(),
                                 matches: true,
                                 location: candidate.location.clone(),
                                 similarity_score: normalized_score,
-                                raw_matched_text: CompactString::from(snippet.trim()),
+                                prefix: CompactString::from(prefix.trim_start()),
+                                match_text: CompactString::from(match_text),
+                                suffix: CompactString::from(suffix.trim_end()),
                             });
                         }
                     }
@@ -291,9 +295,21 @@ impl StructuralSearchEngine {
 pub struct DisplayRow {
     pub query: String,
     pub matched: String,
-    pub raw_text: String,
+    pub prefix: String,
+    pub match_text: String,
+    pub suffix: String,
     pub location: String,
     pub score: f32,
+}
+
+impl DisplayRow {
+    pub fn full_text(&self) -> String {
+        if self.matched == "Yes" {
+            format!("{}{}{}", self.prefix, self.match_text, self.suffix)
+        } else {
+            self.prefix.clone()
+        }
+    }
 }
 
 pub struct TraceTextApp;
@@ -303,6 +319,8 @@ impl TraceTextApp {
         file_path: &Path,
         queries: Vec<CompactString>,
         threshold: f32,
+        buffer_size: usize,
+        display_limit: usize,
     ) -> Result<Vec<DisplayRow>> {
         let extractor = DocumentExtractor;
         let ext = file_path.extension().and_then(|e| e.to_str())
@@ -316,15 +334,13 @@ impl TraceTextApp {
 
         let engine = StructuralSearchEngine::new(queries.clone());
         
-        // FIX 3: Pass &candidates directly to cleanly coerce into &[TextCandidate] slice 
-        // avoiding the &Vec<&TextCandidate> compiler type mismatch
         let filtered_candidates = engine.filter_candidates(&candidates);
-        let successful_matches = engine.process_candidates(&filtered_candidates, threshold);
+        let successful_matches = engine.process_candidates(&filtered_candidates, threshold, buffer_size);
 
-        Ok(Self::aggregate_results(&queries, &successful_matches))
+        Ok(Self::aggregate_results(&queries, &successful_matches, display_limit))
     }
 
-    fn aggregate_results(all_queries: &[CompactString], matches: &[QueryMatch]) -> Vec<DisplayRow> {
+    fn aggregate_results(all_queries: &[CompactString], matches: &[QueryMatch], display_limit: usize) -> Vec<DisplayRow> {
         let mut match_map: HashMap<&CompactString, Vec<&QueryMatch>> = HashMap::new();
         for m in matches { match_map.entry(&m.query).or_default().push(m); }
 
@@ -341,18 +357,33 @@ impl TraceTextApp {
                         },
                     };
                     
-                    let sanitized_text = m.raw_matched_text.replace('\n', " ");
-                    let display_limit = 150;
-                    let raw_text = if sanitized_text.chars().count() > display_limit {
-                        format!("{}...", sanitized_text.chars().take(display_limit).collect::<String>())
-                    } else {
-                        sanitized_text
-                    };
+                    let mut prefix_clean = m.prefix.replace('\n', " ");
+                    let match_clean = m.match_text.replace('\n', " ");
+                    let mut suffix_clean = m.suffix.replace('\n', " ");
+
+                    let match_len = match_clean.chars().count();
+                    let total_len = prefix_clean.chars().count() + match_len + suffix_clean.chars().count();
+                    
+                    // Fixed: Using the dynamic display_limit and natural `usize` math.
+                    if total_len > display_limit {
+                        let available = display_limit.saturating_sub(match_len);
+                        let half = available / 2;
+                        
+                        if prefix_clean.chars().count() > half {
+                            let skip_amt = prefix_clean.chars().count() - half;
+                            prefix_clean = format!("...{}", prefix_clean.chars().skip(skip_amt).collect::<String>());
+                        }
+                        if suffix_clean.chars().count() > half {
+                            suffix_clean = format!("{}...", suffix_clean.chars().take(half).collect::<String>());
+                        }
+                    }
 
                     rows.push(DisplayRow {
                         query: query.to_string(),
                         matched: "Yes".to_string(),
-                        raw_text,
+                        prefix: prefix_clean,
+                        match_text: match_clean,
+                        suffix: suffix_clean,
                         location: location_str,
                         score: m.similarity_score,
                     });
@@ -361,7 +392,9 @@ impl TraceTextApp {
                 rows.push(DisplayRow {
                     query: query.to_string(),
                     matched: "No".to_string(),
-                    raw_text: "N/A".to_string(),
+                    prefix: "N/A".to_string(),
+                    match_text: "".to_string(),
+                    suffix: "".to_string(),
                     location: "N/A".to_string(),
                     score: 0.0,
                 });
@@ -377,6 +410,8 @@ struct TraceTextGui {
     file_path: Option<PathBuf>,
     queries_text: String,
     threshold: f32,
+    buffer_size: usize,
+    display_limit: usize,
     results: Vec<DisplayRow>,
     status_message: String,
 }
@@ -387,6 +422,8 @@ impl Default for TraceTextGui {
             file_path: None,
             queries_text: "".to_string(),
             threshold: 90.0,
+            buffer_size: 100,
+            display_limit: 200,
             results: Vec::new(),
             status_message: "Ready. Select a file to begin.".into(),
         }
@@ -400,7 +437,7 @@ impl eframe::App for TraceTextGui {
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
-                if ui.button("📂 Select PDF/Word Document").clicked() {
+                if ui.button("📁 Select PDF/Word Document").clicked() {
                     if let Some(path) = FileDialog::new()
                         .add_filter("Documents", &["pdf", "docx"])
                         .pick_file() {
@@ -420,11 +457,18 @@ impl eframe::App for TraceTextGui {
             ui.add(egui::TextEdit::multiline(&mut self.queries_text).desired_rows(5).desired_width(f32::INFINITY));
             ui.add_space(10.0);
 
-            ui.add(egui::Slider::new(&mut self.threshold, 0.0..=100.0).text("Similarity Threshold (%)"));
+            // UPGRADED: Added sliders for Buffer and Display Limit
+            ui.horizontal(|ui| {
+                ui.add(egui::Slider::new(&mut self.threshold, 0.0..=100.0).text("Threshold (%)"));
+                ui.add_space(15.0);
+                ui.add(egui::Slider::new(&mut self.buffer_size, 10..=200).text("Context Buffer"));
+                ui.add_space(15.0);
+                ui.add(egui::Slider::new(&mut self.display_limit, 50..=500).text("Display Limit"));
+            });
             ui.add_space(10.0);
 
             ui.horizontal(|ui| {
-                if ui.button("🚀 Run Search").clicked() {
+                if ui.button("🔍 Run Search").clicked() {
                     if let Some(path) = &self.file_path {
                         let queries: Vec<CompactString> = self.queries_text
                             .lines()
@@ -432,7 +476,8 @@ impl eframe::App for TraceTextGui {
                             .map(|l| CompactString::from(l.trim()))
                             .collect();
 
-                        match TraceTextApp::run_search(path, queries, self.threshold) {
+                        // Pass the new variables to the engine
+                        match TraceTextApp::run_search(path, queries, self.threshold, self.buffer_size, self.display_limit) {
                             Ok(res) => {
                                 self.results = res;
                                 self.status_message = format!("Found {} result rows.", self.results.len());
@@ -495,7 +540,40 @@ impl eframe::App for TraceTextGui {
                             body.row(25.0, |mut ui_row| {
                                 ui_row.col(|ui| { ui.label(&row.query); });
                                 ui_row.col(|ui| { ui.label(&row.matched); });
-                                ui_row.col(|ui| { ui.label(&row.raw_text); });
+                                
+                                ui_row.col(|ui| {
+                                    if row.matched == "Yes" {
+                                        let mut job = egui::text::LayoutJob::default();
+                                        let font_id = egui::TextStyle::Body.resolve(ui.style());
+                                        
+                                        let text_color = ui.visuals().text_color();
+                                        let match_color = ui.visuals().strong_text_color();
+
+                                        job.append(&row.prefix, 0.0, egui::TextFormat {
+                                            font_id: font_id.clone(),
+                                            color: text_color,
+                                            ..Default::default()
+                                        });
+                                        
+                                        job.append(&row.match_text, 0.0, egui::TextFormat {
+                                            font_id: font_id.clone(),
+                                            color: match_color,
+                                            underline: egui::Stroke::new(1.5, match_color),
+                                            ..Default::default()
+                                        });
+                                        
+                                        job.append(&row.suffix, 0.0, egui::TextFormat {
+                                            font_id,
+                                            color: text_color,
+                                            ..Default::default()
+                                        });
+
+                                        ui.label(job);
+                                    } else {
+                                        ui.label(&row.prefix);
+                                    }
+                                });
+                                
                                 ui_row.col(|ui| { ui.label(&row.location); });
                                 ui_row.col(|ui| { ui.label(format!("{:.2}", row.score)); });
                             });
@@ -511,7 +589,7 @@ impl eframe::App for TraceTextGui {
 fn format_clipboard_tsv(results: &[DisplayRow]) -> String {
     let mut tsv = String::from("Search Query\tMatched\tRaw Matched Text\tStructural Location\tScore\n");
     for r in results {
-        tsv.push_str(&format!("{}\t{}\t{}\t{}\t{:.2}\n", r.query, r.matched, r.raw_text, r.location, r.score));
+        tsv.push_str(&format!("{}\t{}\t{}\t{}\t{:.2}\n", r.query, r.matched, r.full_text(), r.location, r.score));
     }
     tsv
 }
@@ -530,7 +608,7 @@ fn export_to_excel(results: &[DisplayRow], path: &Path) -> Result<()> {
         let r = (row_idx + 1) as u32;
         worksheet.write_string(r, 0, &row.query)?;
         worksheet.write_string(r, 1, &row.matched)?;
-        worksheet.write_string(r, 2, &row.raw_text)?;
+        worksheet.write_string(r, 2, &row.full_text())?;
         worksheet.write_string(r, 3, &row.location)?;
         worksheet.write_number(r, 4, row.score as f64)?;
     }
