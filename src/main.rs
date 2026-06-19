@@ -1,3 +1,5 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
 use anyhow::{Context, Result};
 use std::{path::{Path, PathBuf}, ops::ControlFlow, collections::HashMap};
 use unpdf::{PdfParser, PageStreamOptions, ParseEvent};

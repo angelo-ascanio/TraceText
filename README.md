@@ -44,4 +44,51 @@ The core engine relies on the following key dependencies:
 ### 1. Clone the repository
 ```bash
 git clone [https://github.com/angelo-ascanio/TraceText.git](https://github.com/angelo-ascanio/TraceText.git)
-cd tracetext
+cd TraceText
+
+```
+
+### 2. Build and Run
+
+For production use, always execute compilation with the `--release` flag. This ensures that the heavy text normalization blocks, fuzzy matching matrices, and parallel iterator structures are optimized for maximum speed:
+
+```bash
+cargo run --release
+
+```
+
+---
+
+## 🎛️ Windows Optimization (Hiding the Console)
+
+By default, launching a GUI app on Windows triggers a companion command prompt window. TraceText bypasses this in production by including the following conditional attribute at the crown of `main.rs`:
+
+```rust
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+```
+
+This guarantees that dev builds (`cargo run`) retain the terminal for stdout/stderr logs, while release binaries (`cargo run --release`) launch directly into a clean, windowed UX.
+
+---
+
+## 📖 Usage Guide
+
+1. **Select a Target File:** Click **"Select PDF/Word Document"** to pull up a native file picker. Select any `.pdf` or `.docx` file.
+2. **Define Search Queries:** Type or paste your tracking benchmarks, clause items, or regex-like string targets into the multiline editor (**one query per line**).
+3. **Set the Similarity Threshold:** Adjust the slider to tune match tolerance.
+* **`100%`** demands absolute character alignments.
+* **`85% - 95%`** gracefully absorbs typo variations, character omissions, or minor spacing differences typical of PDF layout reflows.
+
+
+4. **Execute:** Click **"Run Search"** to run the parallel search array.
+5. **Extract Results:** * Use **"Copy Table"** to instantly move the results grid onto your clipboard formatted as Tab-Separated Values (TSV)—perfect for dropping into target spreadsheets.
+* Click **"Export to Excel"** to generate a beautifully structured, native spreadsheet report automatically.
+
+---
+
+## 📜 License
+
+This project is licensed under the MIT License. See the [LICENSE](https://www.google.com/search?q=LICENSE) file for details.
+
+---
