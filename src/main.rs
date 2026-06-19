@@ -149,10 +149,15 @@ impl StructuralSearchEngine {
             .collect();
 
         self.queries.par_iter().flat_map(|query| {
+            // --- NEW: Normalize the query string ---
+            let normalized_query = Self::normalize_text(query.as_str());
+            
             let mut matcher = Matcher::new(Config::DEFAULT);
             let mut results = Vec::new();
-            let pattern = Pattern::parse(query.as_str(), CaseMatching::Ignore, Normalization::Smart);
-            let utf32_query = nucleo_matcher::Utf32String::from(query.as_str());
+            
+            // --- UPDATE: Feed the normalized query into the Pattern and Utf32String ---
+            let pattern = Pattern::parse(normalized_query.as_str(), CaseMatching::Ignore, Normalization::Smart);
+            let utf32_query = nucleo_matcher::Utf32String::from(normalized_query.as_str());
             let perfect_score = pattern.score(utf32_query.slice(..), &mut matcher).unwrap_or(1) as f32;
             let mut indices = Vec::new();
 
@@ -169,10 +174,11 @@ impl StructuralSearchEngine {
                         let end_idx = *indices.last().unwrap() as usize;
                         let match_span = end_idx.saturating_sub(start_idx) + 1;
                         
-                        let query_len = query.chars().count();
+                        // --- UPDATE: Use the normalized query's length for accurate span limitation ---
+                        let query_len = normalized_query.chars().count(); 
                         if match_span > (query_len as f32 * 2.5) as usize { continue; }
 
-                        let buffer = 15;
+                        let buffer = 40;
                         let snippet_start = start_idx.saturating_sub(buffer);
                         let snippet_len = match_span + (buffer * 2);
 
@@ -183,8 +189,9 @@ impl StructuralSearchEngine {
                         if snippet_start + snippet_len < candidate.text.chars().count() {
                             snippet.push_str("...");
                         }
+                        
                         results.push(QueryMatch {
-                            query: query.clone(),
+                            query: query.clone(), // Keep the original unnormalized query so it renders exactly as typed in the GUI
                             matches: true,
                             location: candidate.location.clone(),
                             similarity_score: normalized_score,
@@ -258,7 +265,7 @@ impl TraceTextApp {
                     };
                     
                     let sanitized_text = m.raw_matched_text.replace('\n', " ");
-                    let display_limit = 100;
+                    let display_limit = 150;
                     let raw_text = if sanitized_text.chars().count() > display_limit {
                         format!("{}...", sanitized_text.chars().take(display_limit).collect::<String>())
                     } else {
