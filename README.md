@@ -43,7 +43,7 @@ The core engine relies on the following key dependencies:
 
 ### 1. Clone the repository
 ```bash
-git clone [https://github.com/angelo-ascanio/TraceText.git](https://github.com/angelo-ascanio/TraceText.git)
+git clone https://github.com/angelo-ascanio/TraceText.git
 cd TraceText
 
 ```

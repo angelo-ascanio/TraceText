@@ -172,7 +172,7 @@ impl StructuralSearchEngine {
                         let query_len = query.chars().count();
                         if match_span > (query_len as f32 * 2.5) as usize { continue; }
 
-                        let buffer = 5;
+                        let buffer = 15;
                         let snippet_start = start_idx.saturating_sub(buffer);
                         let snippet_len = match_span + (buffer * 2);
 
@@ -258,7 +258,7 @@ impl TraceTextApp {
                     };
                     
                     let sanitized_text = m.raw_matched_text.replace('\n', " ");
-                    let display_limit = 60; 
+                    let display_limit = 100;
                     let raw_text = if sanitized_text.chars().count() > display_limit {
                         format!("{}...", sanitized_text.chars().take(display_limit).collect::<String>())
                     } else {
