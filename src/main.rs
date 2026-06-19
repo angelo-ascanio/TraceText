@@ -14,7 +14,7 @@ use egui_extras::{TableBuilder, Column};
 use rfd::FileDialog;
 use rust_xlsxwriter::Workbook;
 
-// --- Existing Core Logic ---
+// --- Phase 1: Foundational Data Structures ---
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct QueryMatch {
@@ -41,6 +41,7 @@ pub enum StructuralLocation {
 #[derive(Debug, Clone)]
 pub struct TextCandidate {
     pub text: String,
+    pub normalized_text: String, // NEW: Cache normalized text to prevent CPU thrashing
     pub location: StructuralLocation,
 }
 
@@ -53,22 +54,31 @@ impl DocumentExtractor {
 
         parser.for_each_page(PageStreamOptions::default(), |event| {
             if let ParseEvent::PageParsed(page) = event {
-                let mut candidates = candidates_accumulator.lock().unwrap();
+                // NEW: Page-local batching to eliminate O(N) lock contention
+                let mut page_candidates = Vec::new(); 
                 
-                // Added .iter().enumerate() to capture the element index
                 for (elem_idx, element) in page.elements.iter().enumerate() {
                     let mut page_text = String::new();
                     element.append_plain_text(&mut page_text);
                     
                     if !page_text.trim().is_empty() {
-                        candidates.push(TextCandidate {
-                            text: page_text,
+                        let raw_text = page_text.clone();
+                        let normalized_text = StructuralSearchEngine::normalize_text(&raw_text);
+
+                        page_candidates.push(TextCandidate {
+                            text: raw_text,
+                            normalized_text,
                             location: StructuralLocation::Pdf { 
                                 page_number: page.number,
                                 block_index: elem_idx,
                             },
                         });
                     }
+                }
+
+                // Append batch using a single mutex lock per page
+                if !page_candidates.is_empty() {
+                    candidates_accumulator.lock().unwrap().extend(page_candidates);
                 }
             }
             ControlFlow::Continue(())
@@ -83,7 +93,7 @@ impl DocumentExtractor {
         let mut candidates = Vec::new();
 
         let mut current_heading = String::from("Start of Document");
-        let mut global_para_count = 0; // Initialize global counter
+        let mut global_para_count = 0; 
 
         for section in doc.sections.iter() {
             for block in section.content.iter() {
@@ -98,7 +108,6 @@ impl DocumentExtractor {
                     continue;
                 }
 
-                // Increment for every valid block of text
                 global_para_count += 1;
 
                 let char_count = trimmed.chars().count();
@@ -109,10 +118,14 @@ impl DocumentExtractor {
                     }
                 }
 
+                let raw_text = text.clone();
+                let normalized_text = StructuralSearchEngine::normalize_text(&raw_text);
+
                 candidates.push(TextCandidate {
-                    text: text.clone(),
+                    text: raw_text,
+                    normalized_text,
                     location: StructuralLocation::Docx { 
-                        global_paragraph_index: global_para_count, // Use global count
+                        global_paragraph_index: global_para_count,
                         heading_context: current_heading.clone(),
                     },
                 });
@@ -122,91 +135,155 @@ impl DocumentExtractor {
     }
 }
 
+// --- Phase 2: Multi-Step Structural Search Engine ---
+
 pub struct StructuralSearchEngine {
     queries: Vec<CompactString>,
+    normalized_queries: Vec<String>,
+    perfect_scores: Vec<f32>,
     aho_corasick: Option<AhoCorasick>,
 }
 
 impl StructuralSearchEngine {
     pub fn new(queries: Vec<CompactString>) -> Self {
-        let patterns: Vec<String> = queries.iter().map(|q| Self::normalize_text(q)).collect();
+        let mut normalized_queries = Vec::with_capacity(queries.len());
+        let mut perfect_scores = Vec::with_capacity(queries.len());
+        
+        // FIX 1: Config::default() -> Config::DEFAULT
+        let mut matcher = Matcher::new(Config::DEFAULT);
+
+        for query in &queries {
+            let normalized = Self::normalize_text(query.as_str());
+            
+            // Pre-calculate perfect score
+            let pattern = Pattern::parse(
+                &normalized, 
+                CaseMatching::Respect, 
+                Normalization::Never
+            );
+            
+            // FIX 2: Added utf-32 conversion prior to invoking score() instead of match_str()
+            let utf32_normalized = nucleo_matcher::Utf32String::from(normalized.as_str());
+            let perfect_score = pattern.score(utf32_normalized.slice(..), &mut matcher)
+                .map(|score| score as f32)
+                .unwrap_or(1.0); 
+
+            normalized_queries.push(normalized);
+            perfect_scores.push(perfect_score);
+        }
+
         let aho_corasick = AhoCorasick::builder()
             .match_kind(MatchKind::LeftmostFirst)
-            .build(patterns)
+            .build(&normalized_queries)
             .ok();
-        Self { queries, aho_corasick }
+
+        Self { queries, normalized_queries, perfect_scores, aho_corasick }
+    }
+
+    pub fn normalize_text(input: &str) -> String {
+        input.nfd()
+            .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+            .nfkc()
+            .flat_map(|c| c.to_lowercase())
+            .collect()
     }
 
     pub fn filter_candidates<'a>(&self, candidates: &'a [TextCandidate]) -> Vec<&'a TextCandidate> {
         let Some(ac) = &self.aho_corasick else { return candidates.iter().collect(); };
-        candidates.iter().filter(|cand| ac.is_match(&Self::normalize_text(&cand.text))).collect()
+        // Evaluate strictly against the normalized text to prevent false negative discards
+        candidates.iter().filter(|cand| ac.is_match(&cand.normalized_text)).collect()
     }
 
     pub fn process_candidates(&self, candidates: &[&TextCandidate], threshold: f32) -> Vec<QueryMatch> {
-        let normalized_candidates: Vec<(&TextCandidate, String)> = candidates
-            .par_iter()
-            .map(|&cand| (cand, Self::normalize_text(&cand.text)))
-            .collect();
+        // Use thread-local Matcher to avoid matrix reallocation overhead
+        thread_local! {
+            static THREAD_MATCHER: std::cell::RefCell<Matcher> = 
+                // FIX 1: Config::default() -> Config::DEFAULT
+                std::cell::RefCell::new(Matcher::new(Config::DEFAULT));
+        }
 
-        self.queries.par_iter().flat_map(|query| {
-            // --- NEW: Normalize the query string ---
-            let normalized_query = Self::normalize_text(query.as_str());
-            
-            let mut matcher = Matcher::new(Config::DEFAULT);
-            let mut results = Vec::new();
-            
-            // --- UPDATE: Feed the normalized query into the Pattern and Utf32String ---
-            let pattern = Pattern::parse(normalized_query.as_str(), CaseMatching::Ignore, Normalization::Smart);
-            let utf32_query = nucleo_matcher::Utf32String::from(normalized_query.as_str());
-            let perfect_score = pattern.score(utf32_query.slice(..), &mut matcher).unwrap_or(1) as f32;
-            let mut indices = Vec::new();
+        candidates.par_iter().flat_map(|&candidate| {
+            let mut local_results = Vec::new();
 
-            for (candidate, normalized_text) in &normalized_candidates {
-                indices.clear();
-                let utf32_text = nucleo_matcher::Utf32String::from(normalized_text.as_str());
-                
-                if let Some(score) = pattern.indices(utf32_text.slice(..), &mut matcher, &mut indices) {
-                    let mut normalized_score = (score as f32 / perfect_score) * 100.0;
-                    normalized_score = normalized_score.min(100.0);
+            THREAD_MATCHER.with(|matcher_cell| {
+                let mut matcher = matcher_cell.borrow_mut();
 
-                    if normalized_score >= threshold && !indices.is_empty() {
+                for (idx, query) in self.queries.iter().enumerate() {
+                    let norm_query = &self.normalized_queries[idx];
+                    let perfect_score = self.perfect_scores[idx];
+
+                    // STEP 1: Contiguous Substring Validation -> Exact 100.0
+                    if let Some(byte_idx) = candidate.normalized_text.find(norm_query) {
+                        // Convert the byte index to a character index to align with candidate.text.chars()
+                        let start_idx = candidate.normalized_text[..byte_idx].chars().count();
+                        let query_len = norm_query.chars().count();
+                        
+                        let buffer = 40;
+                        let snippet_start = start_idx.saturating_sub(buffer);
+                        let snippet_len = query_len + (buffer * 2);
+
+                        // Extract snippet centered perfectly around the exact match
+                        let mut snippet: String = candidate.text.chars().skip(snippet_start).take(snippet_len).collect();
+                        if snippet_start > 0 { snippet.insert_str(0, "..."); }
+                        if snippet_start + snippet_len < candidate.text.chars().count() { snippet.push_str("..."); }
+
+                        local_results.push(QueryMatch {
+                            query: query.clone(),
+                            matches: true,
+                            location: candidate.location.clone(),
+                            similarity_score: 100.0,
+                            raw_matched_text: CompactString::from(snippet.trim()),
+                        });
+                        continue;
+                    }
+
+                    // STEP 2 & 3: Fuzzy Sequence Alignment & Bounded Scaling
+                    let pattern = Pattern::parse(
+                        norm_query, 
+                        CaseMatching::Respect, 
+                        Normalization::Never
+                    );
+                    
+                    let utf32_text = nucleo_matcher::Utf32String::from(candidate.normalized_text.as_str());
+                    let mut indices = Vec::new();
+
+                    if let Some(raw_score) = pattern.indices(utf32_text.slice(..), &mut matcher, &mut indices) {
+                        if indices.is_empty() { continue; }
+                        
                         let start_idx = *indices.first().unwrap() as usize;
                         let end_idx = *indices.last().unwrap() as usize;
                         let match_span = end_idx.saturating_sub(start_idx) + 1;
-                        
-                        // --- UPDATE: Use the normalized query's length for accurate span limitation ---
-                        let query_len = normalized_query.chars().count(); 
-                        if match_span > (query_len as f32 * 2.5) as usize { continue; }
+                        let query_len = norm_query.chars().count();
 
-                        let buffer = 40;
-                        let snippet_start = start_idx.saturating_sub(buffer);
-                        let snippet_len = match_span + (buffer * 2);
+                        // Structural Length Guard: Reject if match spans too large of a gap
+                        if match_span as f32 > (query_len as f32 * 2.5) { continue; }
 
-                        let mut snippet: String = candidate.text.chars().skip(snippet_start).take(snippet_len).collect();
-                        if snippet_start > 0 {
-                            snippet.insert_str(0, "...");
+                        // Scale dynamically and apply 99.0 ceiling
+                        let scaled_score = (raw_score as f32 / perfect_score) * 99.0;
+                        let normalized_score = scaled_score.min(99.0);
+
+                        if normalized_score >= threshold {
+                            let buffer = 40;
+                            let snippet_start = start_idx.saturating_sub(buffer);
+                            let snippet_len = match_span + (buffer * 2);
+
+                            let mut snippet: String = candidate.text.chars().skip(snippet_start).take(snippet_len).collect();
+                            if snippet_start > 0 { snippet.insert_str(0, "..."); }
+                            if snippet_start + snippet_len < candidate.text.chars().count() { snippet.push_str("..."); }
+
+                            local_results.push(QueryMatch {
+                                query: query.clone(),
+                                matches: true,
+                                location: candidate.location.clone(),
+                                similarity_score: normalized_score,
+                                raw_matched_text: CompactString::from(snippet.trim()),
+                            });
                         }
-                        if snippet_start + snippet_len < candidate.text.chars().count() {
-                            snippet.push_str("...");
-                        }
-                        
-                        results.push(QueryMatch {
-                            query: query.clone(), // Keep the original unnormalized query so it renders exactly as typed in the GUI
-                            matches: true,
-                            location: candidate.location.clone(),
-                            similarity_score: normalized_score,
-                            raw_matched_text: CompactString::from(snippet.trim()),
-                        });
                     }
                 }
-            }
-            results
+            });
+            local_results
         }).collect()
-    }
-
-    pub fn normalize_text(input: &str) -> String {
-        input.nfd().filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-            .nfkc().flat_map(|c| c.to_lowercase()).collect()
     }
 }
 
@@ -222,7 +299,6 @@ pub struct DisplayRow {
 pub struct TraceTextApp;
 
 impl TraceTextApp {
-    /// Returns the aggregated rows instead of printing them
     pub fn run_search(
         file_path: &Path,
         queries: Vec<CompactString>,
@@ -239,9 +315,11 @@ impl TraceTextApp {
         };
 
         let engine = StructuralSearchEngine::new(queries.clone());
-        let candidate_refs: Vec<&TextCandidate> = candidates.iter().collect();
-        // Option to uncomment pre-filtering: let filtered_candidates = engine.filter_candidates(&candidates);
-        let successful_matches = engine.process_candidates(&candidate_refs, threshold);
+        
+        // FIX 3: Pass &candidates directly to cleanly coerce into &[TextCandidate] slice 
+        // avoiding the &Vec<&TextCandidate> compiler type mismatch
+        let filtered_candidates = engine.filter_candidates(&candidates);
+        let successful_matches = engine.process_candidates(&filtered_candidates, threshold);
 
         Ok(Self::aggregate_results(&queries, &successful_matches))
     }
@@ -259,7 +337,6 @@ impl TraceTextApp {
                             format!("Page {} (Block {})", page_number, block_index)
                         },
                         StructuralLocation::Docx { global_paragraph_index, heading_context } => {
-                            // Yields: Heading: "Validation Protocol" (Paragraph 142)
                             format!("Heading: \"{}\" (Paragraph {})", heading_context, global_paragraph_index)
                         },
                     };
@@ -308,7 +385,6 @@ impl Default for TraceTextGui {
     fn default() -> Self {
         Self {
             file_path: None,
-            //queries_text: "Verification and Validation of Results\nProcess Automation\nScalability and Performance\nABCDE".to_string(),
             queries_text: "".to_string(),
             threshold: 90.0,
             results: Vec::new(),
@@ -319,12 +395,10 @@ impl Default for TraceTextGui {
 
 impl eframe::App for TraceTextGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        // 2. Use `show_inside` and pass the `ui` instead of `ctx`
         egui::CentralPanel::default().show_inside(ui, |ui| {
             ui.heading("TraceText - Structural Document Search");
             ui.add_space(10.0);
 
-            // 1. File Picker
             ui.horizontal(|ui| {
                 if ui.button("📂 Select PDF/Word Document").clicked() {
                     if let Some(path) = FileDialog::new()
@@ -342,21 +416,16 @@ impl eframe::App for TraceTextGui {
             });
             ui.add_space(10.0);
 
-            // 2. Input Queries
             ui.label("Search Queries (One per line):");
             ui.add(egui::TextEdit::multiline(&mut self.queries_text).desired_rows(5).desired_width(f32::INFINITY));
             ui.add_space(10.0);
 
-            // 3. Threshold Slider
             ui.add(egui::Slider::new(&mut self.threshold, 0.0..=100.0).text("Similarity Threshold (%)"));
             ui.add_space(10.0);
 
-            // 4. Run Button & Status
             ui.horizontal(|ui| {
                 if ui.button("🚀 Run Search").clicked() {
                     if let Some(path) = &self.file_path {
-                        //self.status_message = "Processing...".into();
-                        
                         let queries: Vec<CompactString> = self.queries_text
                             .lines()
                             .filter(|l| !l.trim().is_empty())
@@ -383,15 +452,11 @@ impl eframe::App for TraceTextGui {
             ui.separator();
             ui.add_space(10.0);
 
-            // 5. Output Actions (Copy & Export)
             if !self.results.is_empty() {
                 ui.horizontal(|ui| {
                     if ui.button("📋 Copy Table").clicked() {
                         let tsv = format_clipboard_tsv(&self.results);
-                        
-                        // Use the new clipboard API here
                         ui.ctx().copy_text(tsv); 
-                        
                         self.status_message = "Table copied to clipboard!".into();
                     }
 
@@ -409,7 +474,6 @@ impl eframe::App for TraceTextGui {
                 });
                 ui.add_space(10.0);
 
-                // 6. Data Table Rendering
                 TableBuilder::new(ui)
                     .striped(true)
                     .resizable(true)

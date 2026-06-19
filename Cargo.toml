@@ -1,6 +1,6 @@
 [package]
 name = "TraceText"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 
 [dependencies]
@@ -18,3 +18,10 @@ eframe = "0.34.3"
 egui_extras = "0.34.3"
 rfd = "0.17.2"
 rust_xlsxwriter = "0.95.0"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
