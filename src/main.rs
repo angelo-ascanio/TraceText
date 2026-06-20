@@ -43,7 +43,8 @@ pub enum StructuralLocation {
 #[derive(Debug, Clone)]
 pub struct TextCandidate {
     pub text: String,
-    pub normalized_text: String, 
+    pub normalized_text: String,
+    pub mapping: Vec<usize>,
     pub location: StructuralLocation,
 }
 
@@ -64,11 +65,12 @@ impl DocumentExtractor {
                     
                     if !page_text.trim().is_empty() {
                         let raw_text = page_text.clone();
-                        let normalized_text = StructuralSearchEngine::normalize_text(&raw_text);
+                        let (normalized_text, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&raw_text);
 
                         page_candidates.push(TextCandidate {
                             text: raw_text,
                             normalized_text,
+                            mapping,
                             location: StructuralLocation::Pdf { 
                                 page_number: page.number,
                                 block_index: elem_idx,
@@ -119,11 +121,12 @@ impl DocumentExtractor {
                 }
 
                 let raw_text = text.clone();
-                let normalized_text = StructuralSearchEngine::normalize_text(&raw_text);
+                let (normalized_text, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&raw_text);
 
                 candidates.push(TextCandidate {
                     text: raw_text,
                     normalized_text,
+                    mapping,
                     location: StructuralLocation::Docx { 
                         global_paragraph_index: global_para_count,
                         heading_context: current_heading.clone(),
@@ -178,11 +181,30 @@ impl StructuralSearchEngine {
     }
 
     pub fn normalize_text(input: &str) -> String {
-        input.nfd()
-            .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
-            .nfkc()
-            .flat_map(|c| c.to_lowercase())
-            .collect()
+        Self::normalize_text_with_mapping(input).0
+    }
+
+    pub fn normalize_text_with_mapping(input: &str) -> (String, Vec<usize>) {
+        let mut normalized = String::with_capacity(input.len());
+        let mut mapping = Vec::with_capacity(input.len());
+
+        for (raw_idx, c) in input.chars().enumerate() {
+            // Using a stack-allocated buffer avoids heap allocations per character
+            let mut char_buf = [0; 4];
+            let char_str = c.encode_utf8(&mut char_buf);
+
+            let norm_iter = char_str
+                .nfd()
+                .filter(|ch| !unicode_normalization::char::is_combining_mark(*ch))
+                .nfkc()
+                .flat_map(|ch| ch.to_lowercase());
+
+            for nc in norm_iter {
+                normalized.push(nc);
+                mapping.push(raw_idx);
+            }
+        }
+        (normalized, mapping)
     }
 
     pub fn filter_candidates<'a>(&self, candidates: &'a [TextCandidate]) -> Vec<&'a TextCandidate> {
@@ -208,21 +230,23 @@ impl StructuralSearchEngine {
 
                     // STEP 1: Contiguous Substring Validation -> Exact 100.0
                     if let Some(byte_idx) = candidate.normalized_text.find(norm_query) {
-                        let start_idx = candidate.normalized_text[..byte_idx].chars().count();
-                        let query_len = norm_query.chars().count();
+                        let start_idx_norm = candidate.normalized_text[..byte_idx].chars().count();
+                        let query_len_norm = norm_query.chars().count();
                         
-                        let snippet_start = start_idx.saturating_sub(buffer_size);
-                        let total_chars = candidate.text.chars().count();
+                        if query_len_norm == 0 { continue; }
+                        let end_idx_norm = start_idx_norm + query_len_norm - 1;
 
-                        let prefix_len = start_idx - snippet_start;
-                        let mut prefix: String = candidate.text.chars().skip(snippet_start).take(prefix_len).collect();
-                        if snippet_start > 0 { prefix.insert_str(0, "..."); }
+                        // Translate to true raw boundaries
+                        let start_idx_raw = candidate.mapping[start_idx_norm];
+                        let end_idx_raw = candidate.mapping[end_idx_norm];
+                        
+                        // NEW: Use resolve_highlight to capture the exact byte boundaries
+                        let raw_indices = [start_idx_raw as u32, end_idx_raw as u32];
+                        let (prefix_raw, match_text, suffix_raw) = resolve_highlight(&candidate.text, &raw_indices);
 
-                        let match_text: String = candidate.text.chars().skip(start_idx).take(query_len).collect();
-
-                        let suffix_start = start_idx + query_len;
-                        let mut suffix: String = candidate.text.chars().skip(suffix_start).take(buffer_size).collect();
-                        if suffix_start + buffer_size < total_chars { suffix.push_str("..."); }
+                        // Enforce UI context buffer sizes
+                        let prefix = apply_buffer(&prefix_raw, buffer_size, true);
+                        let suffix = apply_buffer(&suffix_raw, buffer_size, false);
 
                         local_results.push(QueryMatch {
                             query: query.clone(),
@@ -230,7 +254,7 @@ impl StructuralSearchEngine {
                             location: candidate.location.clone(),
                             similarity_score: 100.0,
                             prefix: CompactString::from(prefix.trim_start()),
-                            match_text: CompactString::from(match_text),
+                            match_text,
                             suffix: CompactString::from(suffix.trim_end()),
                         });
                         continue;
@@ -242,36 +266,36 @@ impl StructuralSearchEngine {
                         CaseMatching::Respect, 
                         Normalization::Never
                     );
-                    
+
                     let utf32_text = nucleo_matcher::Utf32String::from(candidate.normalized_text.as_str());
                     let mut indices = Vec::new();
 
                     if let Some(raw_score) = pattern.indices(utf32_text.slice(..), &mut matcher, &mut indices) {
                         if indices.is_empty() { continue; }
                         
-                        let start_idx = *indices.first().unwrap() as usize;
-                        let end_idx = *indices.last().unwrap() as usize;
-                        let match_span = end_idx.saturating_sub(start_idx) + 1;
+                        // GUARANTEE we measure the absolute widest span of the match
+                        let start_idx_norm = *indices.iter().min().unwrap() as usize;
+                        let end_idx_norm = *indices.iter().max().unwrap() as usize;
+                        let match_span_norm = end_idx_norm.saturating_sub(start_idx_norm) + 1;
                         let query_len = norm_query.chars().count();
 
-                        if match_span as f32 > (query_len as f32 * 2.5) { continue; }
+                        // TIGHTEN the bounds: 1.5x query length prevents massive paragraph-wide highlights
+                        if match_span_norm as f32 > (query_len as f32 * 1.5) { continue; }
 
                         let scaled_score = (raw_score as f32 / perfect_score) * 99.0;
                         let normalized_score = scaled_score.min(99.0);
 
                         if normalized_score >= threshold {
-                            let snippet_start = start_idx.saturating_sub(buffer_size);
-                            let total_chars = candidate.text.chars().count();
+                            // Translate to true raw boundaries
+                            let start_idx_raw = candidate.mapping[start_idx_norm];
+                            let end_idx_raw = candidate.mapping[end_idx_norm];
 
-                            let prefix_len = start_idx - snippet_start;
-                            let mut prefix: String = candidate.text.chars().skip(snippet_start).take(prefix_len).collect();
-                            if snippet_start > 0 { prefix.insert_str(0, "..."); }
+                            let raw_indices = [start_idx_raw as u32, end_idx_raw as u32];
+                            let (prefix_raw, match_text, suffix_raw) = resolve_highlight(&candidate.text, &raw_indices);
 
-                            let match_text: String = candidate.text.chars().skip(start_idx).take(match_span).collect();
-
-                            let suffix_start = start_idx + match_span;
-                            let mut suffix: String = candidate.text.chars().skip(suffix_start).take(buffer_size).collect();
-                            if suffix_start + buffer_size < total_chars { suffix.push_str("..."); }
+                            // Enforce UI context buffer sizes
+                            let prefix = apply_buffer(&prefix_raw, buffer_size, true);
+                            let suffix = apply_buffer(&suffix_raw, buffer_size, false);
 
                             local_results.push(QueryMatch {
                                 query: query.clone(),
@@ -279,7 +303,7 @@ impl StructuralSearchEngine {
                                 location: candidate.location.clone(),
                                 similarity_score: normalized_score,
                                 prefix: CompactString::from(prefix.trim_start()),
-                                match_text: CompactString::from(match_text),
+                                match_text,
                                 suffix: CompactString::from(suffix.trim_end()),
                             });
                         }
@@ -305,7 +329,8 @@ pub struct DisplayRow {
 impl DisplayRow {
     pub fn full_text(&self) -> String {
         if self.matched == "Yes" {
-            format!("{}{}{}", self.prefix, self.match_text, self.suffix)
+            // Surrounds the matched segment with { }
+            format!("{}{{{}}}{}", self.prefix, self.match_text, self.suffix)
         } else {
             self.prefix.clone()
         }
@@ -421,7 +446,7 @@ impl Default for TraceTextGui {
         Self {
             file_path: None,
             queries_text: "".to_string(),
-            threshold: 90.0,
+            threshold: 85.0,
             buffer_size: 100,
             display_limit: 200,
             results: Vec::new(),
@@ -555,12 +580,25 @@ impl eframe::App for TraceTextGui {
                                             ..Default::default()
                                         });
                                         
-                                        job.append(&row.match_text, 0.0, egui::TextFormat {
-                                            font_id: font_id.clone(),
-                                            color: match_color,
-                                            underline: egui::Stroke::new(1.5, match_color),
-                                            ..Default::default()
-                                        });
+                                        // Differentiate style based on score perfection
+                                        let is_perfect = row.score >= 99.9;
+                                        let highlight_format = if is_perfect {
+                                            egui::TextFormat {
+                                                font_id: font_id.clone(),
+                                                color: match_color,
+                                                underline: egui::Stroke::new(1.5, match_color),
+                                                ..Default::default()
+                                            }
+                                        } else {
+                                            egui::TextFormat {
+                                                font_id: font_id.clone(),
+                                                color: match_color, // Keeps it prominent
+                                                // Drops the underline for a "lesser" visual footprint
+                                                ..Default::default() 
+                                            }
+                                        };
+                                        
+                                        job.append(&row.match_text, 0.0, highlight_format);
                                         
                                         job.append(&row.suffix, 0.0, egui::TextFormat {
                                             font_id,
@@ -615,6 +653,61 @@ fn export_to_excel(results: &[DisplayRow], path: &Path) -> Result<()> {
 
     workbook.save(path)?;
     Ok(())
+}
+
+pub fn resolve_highlight(
+    raw_text: &str, 
+    indices: &[u32]
+) -> (CompactString, CompactString, CompactString) {
+    if indices.is_empty() {
+        return (
+            CompactString::from(raw_text),
+            CompactString::default(),
+            CompactString::default(),
+        );
+    }
+
+    // GUARANTEE proper ordering to prevent premature loop breaks
+    let start_char_idx = *indices.iter().min().unwrap() as usize;
+    let end_char_idx = *indices.iter().max().unwrap() as usize;
+
+    let mut start_byte = 0;
+    let mut end_byte = raw_text.len();
+    let mut current_char_idx = 0;
+
+    for (byte_idx, c) in raw_text.char_indices() {
+        if current_char_idx == start_char_idx {
+            start_byte = byte_idx;
+        }
+        if current_char_idx == end_char_idx {
+            end_byte = byte_idx + c.len_utf8();
+            break; 
+        }
+        current_char_idx += 1;
+    }
+
+    let prefix = CompactString::from(&raw_text[..start_byte]);
+    let match_text = CompactString::from(&raw_text[start_byte..end_byte]);
+    let suffix = CompactString::from(&raw_text[end_byte..]);
+
+    (prefix, match_text, suffix)
+}
+
+/// Truncates the prefix or suffix to match the requested context buffer size.
+fn apply_buffer(text: &str, buffer_size: usize, is_prefix: bool) -> CompactString {
+    let char_count = text.chars().count();
+    if char_count <= buffer_size {
+        return CompactString::from(text);
+    }
+    
+    if is_prefix {
+        let skip = char_count - buffer_size;
+        let truncated: String = text.chars().skip(skip).collect();
+        CompactString::from(format!("...{}", truncated))
+    } else {
+        let truncated: String = text.chars().take(buffer_size).collect();
+        CompactString::from(format!("{}...", truncated))
+    }
 }
 
 fn main() -> eframe::Result<()> {
