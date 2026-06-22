@@ -65,32 +65,6 @@ impl TraceTextGui {
             }
         });
 
-        // Configuración y aplicación de la paleta de colores corporativos modernos
-        let mut visuals = egui::Visuals::dark();
-        visuals.panel_fill = egui::Color32::from_rgb(15, 23, 42); // Slate 900
-        visuals.window_fill = egui::Color32::from_rgb(30, 41, 59); // Slate 800
-        visuals.extreme_bg_color = egui::Color32::from_rgb(9, 13, 22); // Slate 950
-        visuals.faint_bg_color = egui::Color32::from_rgb(30, 41, 59); // Slate 800
-        
-        // Estilo plano y uniforme para widgets y botones corporativos
-        visuals.widgets.inactive.bg_fill = egui::Color32::from_rgb(30, 41, 59);
-        visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(148, 163, 184));
-        visuals.widgets.inactive.corner_radius = egui::CornerRadius::ZERO;
-        
-        visuals.widgets.hovered.bg_fill = egui::Color32::from_rgb(51, 65, 85);
-        visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(249, 115, 22)); // Orange 500
-        visuals.widgets.hovered.corner_radius = egui::CornerRadius::ZERO;
-        
-        visuals.widgets.active.bg_fill = egui::Color32::from_rgb(234, 88, 12); // Orange 600
-        visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, egui::Color32::WHITE);
-        visuals.widgets.active.corner_radius = egui::CornerRadius::ZERO;
-
-        // Selección de acento vibrante de color naranja para el resaltado interactivo estándar
-        visuals.selection.bg_fill = egui::Color32::from_rgb(234, 88, 12);
-        visuals.selection.stroke = egui::Stroke::new(1.0, egui::Color32::from_rgb(254, 215, 170));
-
-        cc.egui_ctx.set_visuals(visuals);
-
         Self {
             file_path: None,
             queries_text: "".to_string(),
@@ -115,7 +89,6 @@ impl TraceTextGui {
             ui.centered_and_justified(|ui| {
                 ui.label(
                     egui::RichText::new("Seleccione una fila en la tabla para inspeccionar su contexto estructurado.")
-                       .color(egui::Color32::from_rgb(148, 163, 184))
                        .size(14.0)
                 );
             });
@@ -171,16 +144,17 @@ impl TraceTextGui {
         pending_scroll_target: &mut Option<StructuralLocation>
     ) {
         use egui::text::{LayoutJob, TextFormat};
-        use egui::{Color32, FontId, Stroke};
+        use egui::FontId;
 
         let mut job = LayoutJob::default();
         job.break_on_newline = true;
         job.wrap.max_width = ui.available_width();
         
+        // Base formatting
         let normal_format = TextFormat {
             font_id: FontId::proportional(14.0),
             color: ui.visuals().text_color(),
-           ..Default::default()
+        ..Default::default()
         };
 
         if para.is_heading {
@@ -190,23 +164,25 @@ impl TraceTextGui {
             };
             let mut heading_format = TextFormat {
                 font_id: FontId::proportional(h_size),
-                color: Color32::from_rgb(241, 245, 249),
-               ..Default::default()
+                color: ui.visuals().strong_text_color(),
+            ..Default::default()
             };
+            
             if is_target {
-                heading_format.background = Color32::from_rgb(69, 26, 3); // Amber 950
-                heading_format.underline = Stroke::new(2.0, Color32::from_rgb(249, 115, 22)); // Orange 500
-                heading_format.color = Color32::WHITE;
+                // Adaptive highlight for headings
+                heading_format.background = ui.visuals().selection.bg_fill;
+                heading_format.color = ui.visuals().selection.stroke.color;
             }
             job.append(&para.text, 0.0, heading_format);
+            
         } else if is_target {
+            // Adaptive highlight for regular text
             let highlight_format = TextFormat {
                 font_id: FontId::proportional(14.0),
-                color: Color32::from_rgb(252, 211, 77), // Amber 300
-                background: Color32::from_rgb(69, 26, 3), // Amber 950
-                underline: Stroke::new(1.5, Color32::from_rgb(249, 115, 22)), // Orange 500
+                color: ui.visuals().strong_text_color(),
+                background: ui.visuals().selection.bg_fill,
                 expand_bg: 1.5,
-               ..Default::default()
+            ..Default::default()
             };
 
             if let Some(start_idx) = para.text.to_lowercase().find(&match_text.to_lowercase()) {
@@ -228,7 +204,6 @@ impl TraceTextGui {
 
         let response = ui.label(job);
 
-        // Activación del auto-scroll sobre la región geográfica de la interfaz gráfica
         if is_target {
             if let Some(_target) = pending_scroll_target.take() {
                 response.scroll_to_me(Some(egui::Align::Center));
@@ -269,17 +244,13 @@ impl eframe::App for TraceTextGui {
                                 egui::ScrollArea::vertical()
                                     .id_salt("inputs_control_scroll")
                                     .show(ui, |ui| {
-                                        ui.heading(
-                                            egui::RichText::new("Panel de Control y Configuración")
-                                                .color(egui::Color32::from_rgb(241, 245, 249))
-                                                .strong()
-                                        );
+                                        ui.heading(egui::RichText::new("Panel de Control y Configuración").strong());
                                         ui.add_space(8.0);
 
-                                        // 1. Origen de Datos
-                                        ui.label(egui::RichText::new("ORIGEN DE DATOS").strong().size(10.0).color(egui::Color32::from_rgb(249, 115, 22)));
+                                        // 1. Origen de Datos (Stripped custom colors)
+                                        ui.label(egui::RichText::new("ORIGEN DE DATOS").strong().size(10.0));
                                         ui.horizontal_wrapped(|ui| {
-                                            let select_btn = ui.add(egui::Button::new("📁 Seleccionar Documento").fill(egui::Color32::from_rgb(30, 41, 59)));
+                                            let select_btn = ui.add(egui::Button::new("📁 Seleccionar Documento"));
                                             if select_btn.clicked() {
                                                 if let Some(path) = rfd::FileDialog::new().add_filter("Documentos", &["pdf", "docx"]).pick_file() {
                                                     self.file_path = Some(path);
@@ -288,27 +259,25 @@ impl eframe::App for TraceTextGui {
                                             }
 
                                             if let Some(path) = &self.file_path {
-                                                ui.add(egui::Label::new(egui::RichText::new(path.display().to_string()).color(egui::Color32::from_rgb(226, 232, 240)).monospace()).truncate());
+                                                ui.label(egui::RichText::new(path.display().to_string()).monospace());
                                             } else {
-                                                ui.label(egui::RichText::new("Ningún documento seleccionado.").color(egui::Color32::from_rgb(148, 163, 184)).italics());
+                                                ui.label(egui::RichText::new("Ningún documento seleccionado.").italics());
                                             }
                                         });
                                         ui.add_space(8.0);
 
                                         // 2. Parámetros
-                                        ui.label(egui::RichText::new("PARÁMETROS DE BÚSQUEDA").strong().size(10.0).color(egui::Color32::from_rgb(249, 115, 22)));
-                                        //ui.horizontal_wrapped(|ui| {
-                                            ui.add(egui::Slider::new(&mut self.threshold, 0.0..=100.0).text("Umbral (%)"));
-                                            ui.add_space(4.0);
-                                            ui.add(egui::Slider::new(&mut self.buffer_size, 10..=200).text("Búfer"));
-                                            ui.add_space(4.0);
-                                            ui.add(egui::Slider::new(&mut self.display_limit, 50..=500).text("Límite"));
-                                        //});
+                                        ui.label(egui::RichText::new("PARÁMETROS DE BÚSQUEDA").strong().size(10.0));
+                                        ui.add(egui::Slider::new(&mut self.threshold, 0.0..=100.0).text("Umbral (%)"));
+                                        ui.add_space(4.0);
+                                        ui.add(egui::Slider::new(&mut self.buffer_size, 10..=200).text("Búfer"));
+                                        ui.add_space(4.0);
+                                        ui.add(egui::Slider::new(&mut self.display_limit, 50..=500).text("Límite"));
                                         ui.add_space(8.0);
 
                                         // 3. Botonera de Herramientas
                                         ui.horizontal_wrapped(|ui| {
-                                            let search_btn = ui.add(egui::Button::new(egui::RichText::new("🔍 Ejecutar Búsqueda").color(egui::Color32::WHITE).strong()).fill(egui::Color32::from_rgb(234, 88, 12)));
+                                            let search_btn = ui.add(egui::Button::new(egui::RichText::new("🔍 Ejecutar Búsqueda").strong()));
                                             if search_btn.clicked() {
                                                 if let Some(path) = &self.file_path {
                                                     let queries: Vec<compact_str::CompactString> = self.queries_text.lines().filter(|l| !l.trim().is_empty()).map(|l| compact_str::CompactString::from(l.trim())).collect();
@@ -331,7 +300,7 @@ impl eframe::App for TraceTextGui {
                                                 }
                                             }
 
-                                            if ui.add(egui::Button::new("📊 Excel").fill(egui::Color32::from_rgb(30, 41, 59))).clicked() {
+                                            if ui.add(egui::Button::new("📊 Excel")).clicked() {
                                                 if self.results.is_empty() {
                                                     self.status_message = "Error: No hay datos en la tabla.".into();
                                                 } else if let Some(save_path) = rfd::FileDialog::new().add_filter("Excel", &["xlsx"]).set_file_name("Resultados.xlsx").save_file() {
@@ -342,7 +311,7 @@ impl eframe::App for TraceTextGui {
                                                 }
                                             }
 
-                                            if ui.add(egui::Button::new("📋 Copiar").fill(egui::Color32::from_rgb(30, 41, 59))).clicked() {
+                                            if ui.add(egui::Button::new("📋 Copiar")).clicked() {
                                                 if !self.results.is_empty() {
                                                     ui.ctx().copy_text(crate::utils::format_clipboard_tsv(&self.results));
                                                     self.status_message = "Transferido al portapapeles.".into();
@@ -353,8 +322,8 @@ impl eframe::App for TraceTextGui {
 
                                         // 4. Estado
                                         ui.horizontal(|ui| {
-                                            ui.label(egui::RichText::new("Estado:").size(11.0).color(egui::Color32::from_rgb(148, 163, 184)));
-                                            ui.add(egui::Label::new(egui::RichText::new(&self.status_message).color(egui::Color32::from_rgb(226, 232, 240)).size(11.0)).truncate());
+                                            ui.label(egui::RichText::new("Estado:").size(11.0));
+                                            ui.label(egui::RichText::new(&self.status_message).size(11.0));
                                         });
                                     });
                             });
@@ -362,7 +331,7 @@ impl eframe::App for TraceTextGui {
                             // --- IZQUIERDA BOTTOM: Multiline Query ---
                             left_strip.cell(|ui| {
                                 ui.add_space(6.0);
-                                ui.label(egui::RichText::new("PANEL DE CONSULTA (UNA POR LÍNEA)").strong().size(10.0).color(egui::Color32::from_rgb(249, 115, 22)));
+                                ui.label(egui::RichText::new("PANEL DE CONSULTA (UNA POR LÍNEA)").strong().size(10.0));
                                 ui.add_space(4.0);
                                 
                                 // Ocupa dinámicamente todo el espacio vertical sobrante (Size::remainder)
@@ -389,12 +358,12 @@ impl eframe::App for TraceTextGui {
                             
                             // --- DERECHA TOP: Tabla de Resultados ---
                             right_strip.cell(|ui| {
-                                ui.label(egui::RichText::new("TABLA DE RESULTADOS").strong().size(10.0).color(egui::Color32::from_rgb(249, 115, 22)));
+                                ui.label(egui::RichText::new("TABLA DE RESULTADOS").strong().size(10.0));
                                 ui.add_space(4.0);
 
                                 if self.results.is_empty() {
                                     ui.centered_and_justified(|ui| {
-                                        ui.label(egui::RichText::new("Sin coincidencias activas. Defina las consultas y ejecute la búsqueda.").color(egui::Color32::from_rgb(148, 163, 184)).italics());
+                                        ui.label(egui::RichText::new("Sin coincidencias activas. Defina las consultas y ejecute la búsqueda.").italics());
                                     });
                                 } else {
                                     TableBuilder::new(ui)
@@ -423,9 +392,7 @@ impl eframe::App for TraceTextGui {
                                                     
                                                     ui_row.col(|ui| { if ui.add(egui::Label::new(&row.query).sense(egui::Sense::click())).clicked() { row_interacted = true; }});
                                                     ui_row.col(|ui| {
-                                                        let is_perfect = row.score >= 99.9;
-                                                        let score_color = if is_perfect { egui::Color32::from_rgb(249, 115, 22) } else if row.score >= 80.0 { egui::Color32::from_rgb(245, 158, 11) } else { ui.visuals().text_color() };
-                                                        if ui.add(egui::Label::new(egui::RichText::new(format!("{:.2}", row.score)).strong().color(score_color)).sense(egui::Sense::click())).clicked() { row_interacted = true; }
+                                                        if ui.add(egui::Label::new(egui::RichText::new(format!("{:.2}", row.score)).strong()).sense(egui::Sense::click())).clicked() { row_interacted = true; }
                                                     });
                                                     ui_row.col(|ui| {
                                                         if row.score > 0.0 {
@@ -433,15 +400,13 @@ impl eframe::App for TraceTextGui {
                                                             job.wrap.max_width = ui.available_width();
                                                             let font_id = egui::TextStyle::Body.resolve(ui.style());
                                                             let text_color = ui.visuals().text_color();
-                                                            let is_perfect = row.score >= 99.9;
-                                                            let match_color = if is_perfect { egui::Color32::from_rgb(249, 115, 22) } else { egui::Color32::from_rgb(245, 158, 11) };
 
                                                             job.append(&row.prefix, 0.0, egui::TextFormat { font_id: font_id.clone(), color: text_color, ..Default::default() });
                                                             
-                                                            let highlight_format = if is_perfect {
-                                                                egui::TextFormat { font_id: font_id.clone(), color: match_color, underline: egui::Stroke::new(1.5, match_color), ..Default::default() }
-                                                            } else {
-                                                                egui::TextFormat { font_id: font_id.clone(), color: match_color, ..Default::default() }
+                                                            let highlight_format = egui::TextFormat { 
+                                                                font_id: font_id.clone(), 
+                                                                color: ui.visuals().strong_text_color(), 
+                                                                ..Default::default() 
                                                             };
                                                             
                                                             job.append(&row.match_text, 0.0, highlight_format);
@@ -476,7 +441,7 @@ impl eframe::App for TraceTextGui {
                             // --- DERECHA BOTTOM: Visor de Contexto ---
                             right_strip.cell(|ui| {
                                 ui.add_space(8.0);
-                                ui.label(egui::RichText::new("VISUALIZADOR DE DOCUMENTO COMPLETO").strong().size(10.0).color(egui::Color32::from_rgb(249, 115, 22)));
+                                ui.label(egui::RichText::new("VISUALIZADOR DE DOCUMENTO COMPLETO").strong().size(10.0));
                                 ui.separator();
                                 ui.add_space(4.0);
                                 self.draw_context_visualizer(ui);
