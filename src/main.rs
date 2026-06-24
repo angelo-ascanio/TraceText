@@ -3,6 +3,7 @@
 mod app;
 mod extractor;
 mod gui;
+mod palette;
 mod models;
 mod search;
 mod utils;
@@ -13,7 +14,7 @@ use gui::TraceTextGui;
 fn main() -> eframe::Result<()> {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_inner_size([900.0, 600.0])
+            .with_inner_size([1200.0, 600.0])
             .with_min_inner_size([750.0, 500.0]),
         ..Default::default()
     };

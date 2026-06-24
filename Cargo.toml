@@ -18,6 +18,7 @@ eframe = "0.34.3"
 egui_extras = "0.34.3"
 rfd = "0.17.2"
 rust_xlsxwriter = "0.95.0"
+arboard = "3.6.1"
 
 [profile.release]
 opt-level = 3
