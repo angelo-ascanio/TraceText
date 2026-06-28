@@ -1,320 +1,270 @@
-use aho_corasick::{AhoCorasick, MatchKind};
+use crate::models::{QueryMatch, TextCandidate}; //StructuralLocation};
+use crate::utils::resolve_highlight;
 use compact_str::CompactString;
-use nucleo_matcher::{
-    pattern::{CaseMatching, Normalization, Pattern},
-    Config, Matcher,
-};
 use rayon::prelude::*;
 use unicode_normalization::UnicodeNormalization;
-use crate::models::{QueryMatch, TextCandidate};
-use crate::utils::{apply_buffer, resolve_highlight};
+use std::collections::HashSet;
 
+/// High-performance search engine executing multi-layered fuzzy matching
+/// and token-agnostic alignment.
 pub struct StructuralSearchEngine {
-    queries: Vec<CompactString>,
-    normalized_queries: Vec<String>,
-    alpha_queries: Vec<String>,
-    query_ascii_masks: Vec<u128>,
-    query_unique_ascii_counts: Vec<usize>,
-    perfect_scores: Vec<f32>,
-    patterns: Vec<Pattern>,
-    aho_corasick: Option<AhoCorasick>,
-    bypass_ac_filter: bool,
+    candidates: Vec<TextCandidate>,
 }
 
 impl StructuralSearchEngine {
-    pub fn new(queries: Vec<CompactString>) -> Self {
-        let mut normalized_queries = Vec::with_capacity(queries.len());
-        let mut alpha_queries = Vec::with_capacity(queries.len());
-        let mut query_ascii_masks = Vec::with_capacity(queries.len());
-        let mut query_unique_ascii_counts = Vec::with_capacity(queries.len());
-        let mut perfect_scores = Vec::with_capacity(queries.len());
-        let mut patterns = Vec::with_capacity(queries.len());
-        
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let mut bypass_ac_filter = false;
-        let mut sub_words = Vec::new();
+    /// Creates a new search engine instance with a corpus of text candidates.
+    pub fn new(candidates: Vec<TextCandidate>) -> Self {
+        Self { candidates }
+    }
 
-        for query in &queries {
-            let normalized = Self::normalize_text(query.as_str());
-            
-            // Build the pure alphanumeric representation of the query to handle layout noise
-            let alpha: String = normalized
-               .chars()
-               .filter(|c| c.is_alphanumeric())
-               .collect();
-            
-            // Build the character-frequency ASCII bitmask
-            let mut ascii_mask: u128 = 0;
-            let mut unique_chars = std::collections::HashSet::new();
-            for c in normalized.chars() {
-                if c.is_ascii() {
-                    let val = c as u32;
-                    if val < 128 {
-                        ascii_mask |= 1 << val;
-                        unique_chars.insert(c);
+    /// Normalizes raw input text, removing diacritics, layout noise, and punctuation,
+    /// while building a mapping array linking normalized character indices back to original character offsets.
+    pub fn normalize_text_with_mapping(text: &str) -> (String, Vec<usize>) {
+        let mut normalized_text = String::new();
+        let mut mapping = Vec::new();
+
+        let mut char_idx = 0;
+        let mut last_was_space = true;
+
+        for c in text.chars() {
+            let is_whitespace = c.is_whitespace() || c == '\n' || c == '\r' || c == '\t';
+            let is_punctuation = c.is_ascii_punctuation() || "“”‘’*_-•".contains(c);
+
+            if is_whitespace {
+                if!last_was_space {
+                    normalized_text.push(' ');
+                    mapping.push(char_idx);
+                    last_was_space = true;
+                }
+            } else if!is_punctuation {
+                // Canonical Decomposition (NFD) to separate base characters from combining diacritics
+                let decomposed: String = c.to_string().nfd().collect();
+                for dc in decomposed.chars() {
+                    // Filter out combining diacritical marks (U+0300 through U+036F)
+                    if!('\u{0300}'..='\u{036F}').contains(&dc) {
+                        for lc in dc.to_lowercase() {
+                            normalized_text.push(lc);
+                            mapping.push(char_idx);
+                        }
+                        last_was_space = false;
                     }
                 }
             }
-            let unique_ascii_count = unique_chars.len();
-
-            // Pre-compile the Nucleo Pattern to eliminate runtime allocations
-            let pattern = Pattern::parse(
-                &normalized, 
-                CaseMatching::Respect, 
-                Normalization::Never
-            );
-            
-            let utf32_normalized = nucleo_matcher::Utf32String::from(normalized.as_str());
-            let raw_perfect = pattern.score(utf32_normalized.slice(..), &mut matcher)
-               .map(|score| score as f32)
-               .unwrap_or(1.0); 
-            
-            let perfect_score = if raw_perfect <= 0.0 { 1.0 } else { raw_perfect };
-
-            // Extract candidate tokens of length >= 4 for sub-word Aho-Corasick matching
-            let mut words_ge_4 = 0;
-            for word in normalized.split(|c: char|!c.is_alphanumeric()) {
-                if word.chars().count() >= 4 {
-                    sub_words.push(word.to_string());
-                    words_ge_4 += 1;
-                }
-            }
-            
-            if words_ge_4 == 0 {
-                bypass_ac_filter = true;
-            }
-
-            normalized_queries.push(normalized);
-            alpha_queries.push(alpha);
-            query_ascii_masks.push(ascii_mask);
-            query_unique_ascii_counts.push(unique_ascii_count);
-            perfect_scores.push(perfect_score);
-            patterns.push(pattern);
+            char_idx += 1;
         }
 
-        // Deduplicate the sub-word vocabulary to minimize state transitions
-        sub_words.sort();
-        sub_words.dedup();
-
-        let aho_corasick = if!sub_words.is_empty() {
-            AhoCorasick::builder()
-               .match_kind(MatchKind::LeftmostFirst)
-               .build(&sub_words)
-               .ok()
-        } else {
-            None
-        };
-
-        Self {
-            queries,
-            normalized_queries,
-            alpha_queries,
-            query_ascii_masks,
-            query_unique_ascii_counts,
-            perfect_scores,
-            patterns,
-            aho_corasick,
-            bypass_ac_filter,
+        // Clean trailing whitespaces if present
+        if normalized_text.ends_with(' ') {
+            normalized_text.pop();
+            mapping.pop();
         }
+
+        (normalized_text, mapping)
     }
 
-    pub fn normalize_text(input: &str) -> String {
-        Self::normalize_text_with_mapping(input).0
-    }
-
-    pub fn normalize_text_with_mapping(input: &str) -> (String, Vec<usize>) {
-        let mut normalized = String::with_capacity(input.len());
-        let mut mapping = Vec::with_capacity(input.len());
-
-        for (raw_idx, c) in input.chars().enumerate() {
-            let mut char_buf = [0; 4];
-            let char_str = c.encode_utf8(&mut char_buf);
-
-            let norm_iter = char_str
-               .nfd()
-               .filter(|ch|!unicode_normalization::char::is_combining_mark(*ch))
-               .nfkc()
-               .flat_map(|ch| ch.to_lowercase());
-
-            for nc in norm_iter {
-                normalized.push(nc);
-                mapping.push(raw_idx);
-            }
-        }
-        (normalized, mapping)
-    }
-
-    pub fn filter_candidates<'a>(&self, candidates: &'a [TextCandidate]) -> Vec<&'a TextCandidate> {
-        let Some(ac) = &self.aho_corasick else {
-            return candidates.iter().collect();
-        };
-        
-        if self.bypass_ac_filter {
-            return candidates.iter().collect();
-        }
-
-        candidates
-           .iter()
-           .filter(|cand| ac.is_match(&cand.normalized_text))
+    /// Searches the candidate corpus in parallel against a slice of query strings.
+    /// Returns matching records containing location information and context segments.
+    pub fn search(&self, queries: &[CompactString]) -> Vec<QueryMatch> {
+        queries
+           .par_iter()
+           .flat_map(|query| self.search_single_query(query))
            .collect()
     }
 
-    pub fn process_candidates(&self, candidates: &[&TextCandidate], threshold: f32, buffer_size: usize) -> Vec<QueryMatch> {
-        thread_local! {
-            static THREAD_MATCHER: std::cell::RefCell<Matcher> = 
-                std::cell::RefCell::new(Matcher::new(Config::DEFAULT));
+    /// Executes search matching for a single query across all candidates.
+    fn search_single_query(&self, query: &CompactString) -> Vec<QueryMatch> {
+        let (query_norm, _) = Self::normalize_text_with_mapping(query.as_str());
+        if query_norm.is_empty() {
+            return Vec::new();
         }
 
-        candidates.par_iter().flat_map(|&candidate| {
-            let mut local_results = Vec::new();
-
-            // Precompute the candidate's bitmask once to avoid redundant string sweeps
-            let mut cand_mask: u128 = 0;
-            for c in candidate.normalized_text.chars() {
-                if c.is_ascii() {
-                    let val = c as u32;
-                    if val < 128 {
-                        cand_mask |= 1 << val;
-                    }
+        self.candidates
+           .par_iter()
+           .filter_map(|candidate| {
+                let cand_norm = &candidate.normalized_text;
+                if cand_norm.is_empty() {
+                    return None;
                 }
-            }
 
-            // Construct character index mappings for alphanumeric projection
-            let mut cand_alpha = String::with_capacity(candidate.normalized_text.len());
-            let mut cand_alpha_mapping = Vec::with_capacity(candidate.normalized_text.len());
+                // LAYER 1 & 2: Literal / Normalized Substring Matches
+                if let Some(start_byte_idx) = cand_norm.find(&query_norm) {
+                    let start_char_idx = cand_norm[..start_byte_idx].chars().count();
+                    let query_char_count = query_norm.chars().count();
+                    let end_char_idx = start_char_idx + query_char_count - 1;
 
-            for (char_idx, c) in candidate.normalized_text.chars().enumerate() {
-                if c.is_alphanumeric() {
-                    cand_alpha.push(c);
-                    cand_alpha_mapping.push(char_idx);
-                }
-            }
-
-            THREAD_MATCHER.with(|matcher_cell| {
-                let mut matcher = matcher_cell.borrow_mut();
-
-                for (idx, query) in self.queries.iter().enumerate() {
-                    let norm_query = &self.normalized_queries[idx];
-                    let perfect_score = self.perfect_scores[idx];
-                    let pattern = &self.patterns[idx];
-
-                    // --- LAYER 2: Noise-Agnostic Alphanumeric Perfect Matcher (Score = 100.0) ---
-                    let alpha_query = &self.alpha_queries[idx];
-                    if!alpha_query.is_empty() {
-                        if let Some(byte_offset) = cand_alpha.find(alpha_query) {
-                            let start_char_alpha = cand_alpha[..byte_offset].chars().count();
-                            let len_char_alpha = alpha_query.chars().count();
-                            
-                            if len_char_alpha > 0 {
-                                let end_char_alpha = start_char_alpha + len_char_alpha - 1;
-
-                                if start_char_alpha < cand_alpha_mapping.len() && end_char_alpha < cand_alpha_mapping.len() {
-                                    let start_idx_norm = cand_alpha_mapping[start_char_alpha];
-                                    let end_idx_norm = cand_alpha_mapping[end_char_alpha];
-
-                                    if start_idx_norm < candidate.mapping.len() && end_idx_norm < candidate.mapping.len() {
-                                        let start_idx_raw = candidate.mapping[start_idx_norm];
-                                        let end_idx_raw = candidate.mapping[end_idx_norm];
-
-                                        let raw_indices = [start_idx_raw as u32, end_idx_raw as u32];
-                                        let (prefix_raw, match_text, suffix_raw) = resolve_highlight(&candidate.text, &raw_indices);
-
-                                        let prefix = apply_buffer(&prefix_raw, buffer_size, true);
-                                        let suffix = apply_buffer(&suffix_raw, buffer_size, false);
-
-                                        local_results.push(QueryMatch {
-                                            query: query.clone(),
-                                            matches: true,
-                                            location: candidate.location.clone(),
-                                            similarity_score: 100.0,
-                                            prefix: CompactString::from(prefix.trim_start()),
-                                            match_text,
-                                            suffix: CompactString::from(suffix.trim_end()),
-                                        });
-                                        continue; // Perfect match found; bypass subsequence alignment
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    // --- LAYER 1: Dynamic Pre-Filter Bypass ---
-                    // If threshold is below 70.0, exact pre-filtering is disabled to preserve fuzzy recall
-                    if threshold >= 70.0 &&!self.bypass_ac_filter {
-                        if let Some(ac) = &self.aho_corasick {
-                            if!ac.is_match(&candidate.normalized_text) {
-                                continue;
-                            }
-                        }
-                    }
-
-                    // --- LAYER 3: Mathematical Length Pruning Heuristic ---
-                    let query_len = norm_query.chars().count();
-                    if query_len == 0 { continue; }
-
-                    let min_len_norm = ((query_len as f32) * (threshold / 100.0) * 0.7) as usize;
-                    if candidate.normalized_text.chars().count() < min_len_norm {
-                        continue;
-                    }
-
-                    // --- LAYER 4: Bitmask Character-Frequency Filter ---
-                    let q_mask = self.query_ascii_masks[idx];
-                    let q_unique_cnt = self.query_unique_ascii_counts[idx];
-                    let min_unique_matches = ((q_unique_cnt as f32) * (threshold / 100.0) * 0.75) as usize;
-
-                    if min_unique_matches > 0 {
-                        let common_bits = (q_mask & cand_mask).count_ones() as usize;
-                        if common_bits < min_unique_matches {
-                            continue; // Discard unviable candidate
-                        }
-                    }
-
-                    // --- LAYER 5: Parallelized Subsequence Alignment ---
-                    let utf32_text = nucleo_matcher::Utf32String::from(candidate.normalized_text.as_str());
                     let mut indices = Vec::new();
-
-                    if let Some(raw_score) = pattern.indices(utf32_text.slice(..), &mut matcher, &mut indices) {
-                        if indices.is_empty() { continue; }
-                        
-                        let start_idx_norm = *indices.iter().min().unwrap() as usize;
-                        let end_idx_norm = *indices.iter().max().unwrap() as usize;
-                        let match_span_norm = end_idx_norm.saturating_sub(start_idx_norm) + 1;
-
-                        // Enforce dynamic match span limit based on user-defined threshold
-                        let max_span_factor = 1.0 + ((100.0 - threshold) / 100.0);
-                        let max_allowed_span = ((query_len as f32) * max_span_factor).ceil() as usize;
-
-                        if match_span_norm > max_allowed_span { continue; }
-
-                        let scaled_score = (raw_score as f32 / perfect_score) * 99.0;
-                        let normalized_score = scaled_score.min(99.0);
-
-                        if normalized_score >= threshold {
-                            if start_idx_norm < candidate.mapping.len() && end_idx_norm < candidate.mapping.len() {
-                                let start_idx_raw = candidate.mapping[start_idx_norm];
-                                let end_idx_raw = candidate.mapping[end_idx_norm];
-
-                                let raw_indices = [start_idx_raw as u32, end_idx_raw as u32];
-                                let (prefix_raw, match_text, suffix_raw) = resolve_highlight(&candidate.text, &raw_indices);
-
-                                let prefix = apply_buffer(&prefix_raw, buffer_size, true);
-                                let suffix = apply_buffer(&suffix_raw, buffer_size, false);
-
-                                local_results.push(QueryMatch {
-                                    query: query.clone(),
-                                    matches: true,
-                                    location: candidate.location.clone(),
-                                    similarity_score: normalized_score,
-                                    prefix: CompactString::from(prefix.trim_start()),
-                                    match_text,
-                                    suffix: CompactString::from(suffix.trim_end()),
-                                });
-                            }
+                    for i in start_char_idx..=end_char_idx {
+                        if i < candidate.mapping.len() {
+                            indices.push(candidate.mapping[i] as u32);
                         }
                     }
+
+                    let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
+                    
+                    // Assign 100.0 for literal matches, 98.0 for matches requiring normalization
+                    let score = if candidate.text.contains(query.as_str()) {
+                        100.0
+                    } else {
+                        98.0
+                    };
+
+                    return Some(QueryMatch {
+                        query: query.clone(),
+                        matches: true,
+                        location: candidate.location.clone(),
+                        similarity_score: score,
+                        prefix,
+                        match_text,
+                        suffix,
+                    });
                 }
-            });
-            local_results
-        }).collect()
+
+                // LAYER 3: Blended Fuzzy Matcher
+                let score = Self::compute_fuzzy_score(&query_norm, cand_norm);
+
+                if score >= 60.0 {
+                    let (start_norm, end_norm) = Self::find_best_fuzzy_window(&query_norm, cand_norm);
+
+                    let mut indices = Vec::new();
+                    for i in start_norm..=end_norm {
+                        if i < candidate.mapping.len() {
+                            indices.push(candidate.mapping[i] as u32);
+                        }
+                    }
+
+                    let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
+
+                    Some(QueryMatch {
+                        query: query.clone(),
+                        matches: true,
+                        location: candidate.location.clone(),
+                        similarity_score: score,
+                        prefix,
+                        match_text,
+                        suffix,
+                    })
+                } else {
+                    None
+                }
+            })
+           .collect()
+    }
+
+    /// Computes a robust similarity score blending Token Sort, Token Set, and morphological alignment.
+    fn compute_fuzzy_score(query_norm: &str, cand_norm: &str) -> f32 {
+        let q_tokens: Vec<&str> = query_norm.split_whitespace().collect();
+        let c_tokens: Vec<&str> = cand_norm.split_whitespace().collect();
+
+        if q_tokens.is_empty() || c_tokens.is_empty() {
+            return 0.0;
+        }
+
+        // 1. Token Sort Ratio (reordering-agnostic)
+        let mut q_sorted = q_tokens.clone();
+        q_sorted.sort_unstable();
+        let q_sorted_str = q_sorted.join(" ");
+
+        let mut c_sorted = c_tokens.clone();
+        c_sorted.sort_unstable();
+        let c_sorted_str = c_sorted.join(" ");
+
+        let token_sort_sim = strsim::normalized_levenshtein(&q_sorted_str, &c_sorted_str) as f32;
+
+        // 2. Token Set Ratio (abbreviation and subset-agnostic)
+        let q_set: HashSet<&str> = q_tokens.iter().copied().collect();
+        let c_set: HashSet<&str> = c_tokens.iter().copied().collect();
+
+        let intersection: Vec<&str> = q_set.intersection(&c_set).copied().collect();
+        let diff_q: Vec<&str> = q_set.difference(&c_set).copied().collect();
+        let diff_c: Vec<&str> = c_set.difference(&q_set).copied().collect();
+
+        let mut inter_sorted = intersection.clone();
+        inter_sorted.sort_unstable();
+        let t0 = inter_sorted.join(" ");
+
+        let mut t1_vec = intersection.clone();
+        t1_vec.extend(diff_q);
+        t1_vec.sort_unstable();
+        let t1 = t1_vec.join(" ");
+
+        let mut t2_vec = intersection.clone();
+        t2_vec.extend(diff_c);
+        t2_vec.sort_unstable();
+        let t2 = t2_vec.join(" ");
+
+        let sim_t0_t1 = strsim::normalized_levenshtein(&t0, &t1) as f32;
+        let sim_t0_t2 = strsim::normalized_levenshtein(&t0, &t2) as f32;
+        let sim_t1_t2 = strsim::normalized_levenshtein(&t1, &t2) as f32;
+        let token_set_sim = sim_t0_t1.max(sim_t0_t2).max(sim_t1_t2);
+
+        // 3. Word-Level Morphological Alignment (translation and typo resilience)
+        let mut total_morph_score = 0.0;
+        for &qt in &q_tokens {
+            let mut max_word_sim = 0.0;
+            for &ct in &c_tokens {
+                let sim = strsim::jaro_winkler(qt, ct) as f32;
+                if sim > max_word_sim {
+                    max_word_sim = sim;
+                }
+            }
+            total_morph_score += max_word_sim;
+        }
+        let morph_alignment_sim = total_morph_score / (q_tokens.len() as f32);
+
+        // 4. Global Structural String Metrics
+        let jaro_winkler_sim = strsim::jaro_winkler(query_norm, cand_norm) as f32;
+        let normalized_lev_sim = strsim::normalized_levenshtein(query_norm, cand_norm) as f32;
+        let sorensen_dice_sim = strsim::sorensen_dice(query_norm, cand_norm) as f32;
+
+        // Blending coefficients: 40% Token Sort, 30% Token Set, 30% Morphological Alignment
+        let raw_blend = (token_sort_sim * 0.40) + (token_set_sim * 0.30) + (morph_alignment_sim * 0.30);
+
+        // Combine with global metrics to anchor structural alignment
+        let structural_anchor = (jaro_winkler_sim * 0.40) + (normalized_lev_sim * 0.30) + (sorensen_dice_sim * 0.30);
+        let final_raw_score = (raw_blend * 0.70) + (structural_anchor * 0.30);
+
+        // Scale to [0.0 - 95.0] to reserve perfect scores for Layer 1 & 2 matches
+        final_raw_score * 95.0
+    }
+
+    /// Identifies the optimal sliding window within the candidate text to extract highlighting boundaries.
+    fn find_best_fuzzy_window(query_norm: &str, cand_norm: &str) -> (usize, usize) {
+        let q_chars: Vec<char> = query_norm.chars().collect();
+        let c_chars: Vec<char> = cand_norm.chars().collect();
+
+        let q_len = q_chars.len();
+        let c_len = c_chars.len();
+
+        if c_len <= q_len {
+            return (0, c_len.saturating_sub(1));
+        }
+
+        let mut best_score = -1.0;
+        let mut best_range = (0, c_len.saturating_sub(1));
+
+        // Establish boundaries for sliding window sizing
+        let win_min = (q_len as f32 * 0.7) as usize;
+        let win_max = (q_len as f32 * 1.4) as usize;
+
+        // Perform optimized sliding steps for performance under large strings
+        let step = if c_len > 150 { (c_len / 40).max(1) } else { 1 };
+
+        for start in (0..c_len).step_by(step) {
+            for win_size in win_min..=win_max {
+                if start + win_size > c_len {
+                    break;
+                }
+
+                let window_str: String = c_chars[start..(start + win_size)].iter().collect();
+                let score = strsim::jaro_winkler(query_norm, &window_str) as f32;
+
+                if score > best_score {
+                    best_score = score;
+                    best_range = (start, start + win_size - 1);
+                }
+            }
+        }
+
+        best_range
     }
 }

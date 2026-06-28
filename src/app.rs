@@ -4,6 +4,7 @@ use std::{collections::HashMap, path::Path};
 use crate::extractor::DocumentExtractor;
 use crate::models::{QueryMatch, StructuralLocation};
 use crate::search::StructuralSearchEngine;
+use crate::utils::apply_buffer;
 
 #[derive(Clone)]
 pub struct DisplayRow {
@@ -46,15 +47,24 @@ impl TraceTextApp {
             _ => anyhow::bail!("Unsupported file format: {}", ext),
         };
 
-        let engine = StructuralSearchEngine::new(queries.clone());
+        let engine = StructuralSearchEngine::new(candidates);
+        let all_matches = engine.search(&queries);
         
-        let filtered_candidates = engine.filter_candidates(&candidates);
-        let successful_matches = engine.process_candidates(&filtered_candidates, threshold, buffer_size);
+        let successful_matches: Vec<QueryMatch> = all_matches
+            .into_iter()
+            .filter(|m| m.similarity_score >= threshold)
+            .collect();
 
-        Ok(Self::aggregate_results(&queries, &successful_matches, display_limit))
+        // Pass buffer_size down to the aggregate function
+        Ok(Self::aggregate_results(&queries, &successful_matches, buffer_size, display_limit))
     }
 
-    fn aggregate_results(all_queries: &[CompactString], matches: &[QueryMatch], display_limit: usize) -> Vec<DisplayRow> {
+    fn aggregate_results(
+        all_queries: &[CompactString], 
+        matches: &[QueryMatch], 
+        buffer_size: usize, 
+        display_limit: usize
+    ) -> Vec<DisplayRow> {
         let mut match_map: HashMap<&CompactString, Vec<&QueryMatch>> = HashMap::new();
         for m in matches { match_map.entry(&m.query).or_default().push(m); }
 
@@ -71,32 +81,33 @@ impl TraceTextApp {
                         },
                     };
                     
-                    let mut prefix_clean = m.prefix.replace('\n', " ");
+                    let prefix_clean = m.prefix.replace('\n', " ");
                     let match_clean = m.match_text.replace('\n', " ");
-                    let mut suffix_clean = m.suffix.replace('\n', " ");
+                    let suffix_clean = m.suffix.replace('\n', " ");
 
+                    // 1. Apply the standard buffer size extraction using the util function
+                    let mut final_prefix = apply_buffer(&prefix_clean, buffer_size, true).to_string();
+                    let mut final_suffix = apply_buffer(&suffix_clean, buffer_size, false).to_string();
+
+                    // 2. Enforce the strict UI display limit, re-applying the buffer if necessary 
                     let match_len = match_clean.chars().count();
-                    let total_len = prefix_clean.chars().count() + match_len + suffix_clean.chars().count();
+                    let total_len = final_prefix.chars().count() + match_len + final_suffix.chars().count();
                     
                     if total_len > display_limit {
                         let available = display_limit.saturating_sub(match_len);
                         let half = available / 2;
                         
-                        if prefix_clean.chars().count() > half {
-                            let skip_amt = prefix_clean.chars().count() - half;
-                            prefix_clean = format!("...{}", prefix_clean.chars().skip(skip_amt).collect::<String>());
-                        }
-                        if suffix_clean.chars().count() > half {
-                            suffix_clean = format!("{}...", suffix_clean.chars().take(half).collect::<String>());
-                        }
+                        // We run apply_buffer against the original cleaned strings to avoid double ellipses ("......")
+                        final_prefix = apply_buffer(&prefix_clean, half, true).to_string();
+                        final_suffix = apply_buffer(&suffix_clean, half, false).to_string();
                     }
 
                     rows.push(DisplayRow {
                         query: query.to_string(),
                         score: m.similarity_score,
-                        prefix: prefix_clean,
+                        prefix: final_prefix,
                         match_text: match_clean,
-                        suffix: suffix_clean,
+                        suffix: final_suffix,
                         location: location_str,
                         raw_location: Some(m.location.clone()),
                     });
