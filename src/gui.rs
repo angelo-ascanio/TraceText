@@ -213,104 +213,147 @@ impl TraceTextGui {
 
     /// SECCIÓN 2: Panel de Consultas Multilínea (Columna Izquierda Inferior)
     fn draw_queries_panel(&mut self, ui: &mut egui::Ui, pal: &Palette) {
-        ui.label(egui::RichText::new("PANEL DE CONSULTAS (UNA POR LÍNEA)").strong().size(12.0).color(pal.strong_text));
-        ui.separator();
-        ui.add_space(4.0);
+        // Unique identifiers for state tracking and temporary caching
+        let text_edit_id = egui::Id::new("queries_text_edit");
+        let cache_id = egui::Id::new("queries_text_edit_cache");
 
-        // ScrollArea para restringir el crecimiento infinito y proveer barras de desplazamiento.
-        egui::ScrollArea::vertical()
-            .id_salt("queries_scroll")
-            .show(ui, |ui| {
-                
-                // Predescubrimos el ID que egui le asignará al TextEdit para cargar su estado actual.
-                let text_edit_id = ui.next_auto_id();
-                let state_before = egui::TextEdit::load_state(ui.ctx(), text_edit_id);
-                
-                let mut selected_text = None;
-                
-                // Capturamos el rango del texto seleccionado ANTES de que el clic derecho lo limpie.
-                if let Some(state) = &state_before {
-                    if let Some(range) = state.cursor.char_range() {
-                        let start = range.primary.index.min(range.secondary.index);
-                        let end = range.primary.index.max(range.secondary.index);
-                        if start != end {
-                            let chars: Vec<char> = self.queries_text.chars().collect();
-                            if start <= chars.len() && end <= chars.len() {
-                                selected_text = Some(chars[start..end].iter().collect::<String>());
-                            }
-                        }
-                    }
+        ui.vertical(|ui| {
+            // Apply visual configurations matching the application palette
+            ui.visuals_mut().extreme_bg_color = pal.input_bg;
+            ui.visuals_mut().selection.bg_fill = pal.row_sel;
+            //ui.visuals_mut().selection.stroke = egui::Stroke::new(1.0, pal.active_ctrl);
+
+            // Construct the multiline TextEdit widget matching existing layouts
+            let text_edit = egui::TextEdit::multiline(&mut self.queries_text)
+               .id(text_edit_id)
+               .desired_width(f32::INFINITY)
+               .desired_rows(15)
+               .font(egui::TextStyle::Monospace)
+               .hint_text("Escriba sus consultas aquí (una por línea)...");
+
+            // Render the TextEdit widget and capture its layout output metadata
+            let output = text_edit.show(ui);
+
+            // Detect if a secondary pointer action (right-click) is occurring within the widget
+            let is_secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+            let is_secondary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+            let has_secondary_interaction = (is_secondary_down || is_secondary_pressed) && output.response.hovered();
+
+            // Cache the active selection range only on standard frames
+            if let Some(current_range) = output.cursor_range {
+                if!has_secondary_interaction {
+                    ui.ctx().data_mut(|d| d.insert_temp(cache_id, current_range));
                 }
+            }
 
-                let response = ui.add_sized(
-                    ui.available_size(),
-                    egui::TextEdit::multiline(&mut self.queries_text)
-                        .font(egui::TextStyle::Monospace)
-                        .hint_text("Escriba aquí los términos de búsqueda...")
-                );
-
-                // Si el usuario hace clic derecho, interceptamos la acción y 
-                // restauramos el estado anterior para que la selección no desaparezca visualmente.
-                if response.hovered() && ui.input(|i| i.pointer.secondary_pressed()) {
-                    if let Some(state) = state_before.clone() {
-                        state.store(ui.ctx(), response.id);
-                    }
+            // Restore selection state during secondary click frames to prevent default collapse
+            if has_secondary_interaction {
+                if let Some(cached_range) = ui.ctx().data(|d| d.get_temp::<egui::text::CCursorRange>(cache_id)) {
+                    let mut state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), text_edit_id)
+                       .unwrap_or_default();
+                    state.cursor.set_char_range(Some(cached_range));
+                    state.store(ui.ctx(), text_edit_id);
                 }
-                
-                response.context_menu(|ui| {
-                    
-                    // Mostrar la opción de copiar selección solo si hay texto activo.
-                    if let Some(sel) = selected_text {
-                        if ui.button("📋 Copiar Selección").clicked() {
-                            ui.ctx().copy_text(sel);
-                            ui.close();
-                        }
-                    }
+            }
 
-                    if ui.button("📋 Copiar Todo").clicked() {
-                        ui.ctx().copy_text(self.queries_text.clone());
-                        ui.close();
-                    }
-                    
-                    // Acción nativa de Pegar usando arboard para escritorio.
-                    // (Nota: Asegúrate de tener `arboard = "3.4"` o similar en tu Cargo.toml)
-                    if ui.button("📋 Pegar").clicked() {
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            if let Ok(clip_text) = clipboard.get_text() {
-                                if let Some(state) = &state_before {
-                                    if let Some(range) = state.cursor.char_range() {
-                                        let start = range.primary.index.min(range.secondary.index);
-                                        let end = range.primary.index.max(range.secondary.index);
-                                        
-                                        let mut text_chars: Vec<char> = self.queries_text.chars().collect();
-                                        
-                                        // Reemplazar la porción seleccionada con el nuevo texto (o insertarlo)
-                                        text_chars.splice(start..end, clip_text.chars());
-                                        self.queries_text = text_chars.into_iter().collect();
-                                        
-                                        // Mover el cursor al final del texto recién pegado
-                                        let new_idx = start + clip_text.chars().count();
-                                        let mut new_state = state.clone();
-                                        new_state.cursor.set_char_range(Some(
-                                            egui::text::CCursorRange::one(egui::text::CCursor::new(new_idx))
-                                        ));
-                                        new_state.store(ui.ctx(), response.id);
-                                    }
-                                } else {
-                                    // Si por alguna razón no hay cursor activo, anexamos al final.
-                                    self.queries_text.push_str(&clip_text);
-                                }
+            // Bind the context menu handler to the TextEdit response
+            output.response.context_menu(|ui| {
+                // Request focus to keep the underlying TextEdit rendering visual highlights
+                ui.ctx().memory_mut(|mem| mem.request_focus(text_edit_id));
+
+                // Retrieve the preserved character selection range from cache
+                let cached_range: Option<egui::text::CCursorRange> = ui.ctx().data(|d| d.get_temp(cache_id));
+
+                // Determine if a non-zero character selection was active
+                let has_selection = if let Some(range) = cached_range {
+                    range.primary!= range.secondary
+                } else {
+                    false
+                };
+
+                // Bug 1 Resolution: Show "📋 Copiar" only when an active selection range exists
+                if has_selection {
+                    if ui.button("📋 Copiar").clicked() {
+                        if let Some(range) = cached_range {
+                            let char_range = range.as_sorted_char_range();
+                            
+                            // Safe Unicode character collection to safeguard UTF-8 boundaries
+                            let selected_text: String = self.queries_text
+                               .chars()
+                               .skip(char_range.start)
+                               .take(char_range.end - char_range.start)
+                               .collect();
+
+                            if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                                let _ = clipboard.set_text(selected_text);
                             }
                         }
                         ui.close();
                     }
+                }
 
-                    if ui.button("🗑 Limpiar").clicked() {
-                        self.queries_text.clear();
-                        ui.close();
+                // Copy all text option is always available
+                if ui.button("📋 Copiar Todo").clicked() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        let _ = clipboard.set_text(self.queries_text.clone());
                     }
-                });
+                    ui.close();
+                }
+
+                // Bug 2 Resolution: "📋 Pegar" with cursor caret insertion and selection replacement
+                if ui.button("📋 Pegar").clicked() {
+                    if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                        if let Ok(pasted_text) = clipboard.get_text() {
+                            if let Some(range) = cached_range {
+                                let char_range = range.as_sorted_char_range();
+
+                                // Character-level slicing to avoid multi-byte UTF-8 splitting
+                                let before: String = self.queries_text.chars().take(char_range.start).collect();
+                                let after: String = self.queries_text.chars().skip(char_range.end).collect();
+
+                                // Splicing sequence concatenation
+                                self.queries_text = format!("{}{}{}", before, pasted_text, after);
+
+                                // Compute the new caret offset following the inserted text
+                                let pasted_char_count = pasted_text.chars().count();
+                                let new_cursor_pos = char_range.start + pasted_char_count;
+
+                                // Update the TextEditState to focus the new caret position
+                                let mut state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), text_edit_id)
+                                   .unwrap_or_default();
+                                let new_ccursor = egui::text::CCursor::new(new_cursor_pos);
+                                let new_range = egui::text::CCursorRange::one(new_ccursor);
+                                state.cursor.set_char_range(Some(new_range));
+                                state.store(ui.ctx(), text_edit_id);
+
+                                // Update the cache to synchronize with the new caret range
+                                ui.ctx().data_mut(|d| d.insert_temp(cache_id, new_range));
+                            } else {
+                                // Fallback: Append text to the end of the buffer if no selection state exists
+                                self.queries_text.push_str(&pasted_text);
+                            }
+                        }
+                    }
+                    ui.close();
+                }
+
+                // Spanish localized "🗑 Limpiar" button clears the buffer safely
+                if ui.button("🗑 Limpiar").clicked() {
+                    self.queries_text.clear();
+
+                    // Re-initialize the selection state back to index 0
+                    let mut state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), text_edit_id)
+                       .unwrap_or_default();
+                    let zero_ccursor = egui::text::CCursor::new(0);
+                    let zero_range = egui::text::CCursorRange::one(zero_ccursor);
+                    state.cursor.set_char_range(Some(zero_range));
+                    state.store(ui.ctx(), text_edit_id);
+
+                    ui.ctx().data_mut(|d| d.insert_temp(cache_id, zero_range));
+                    ui.close();
+                }
             });
+        });
     }
 
     /// SECCIÓN 3: Tabla de Resultados Completa (Columna Derecha Superior)
@@ -524,17 +567,99 @@ impl TraceTextGui {
             job.append(&para.text, 0.0, normal_format);
         }
 
-        let response = ui.label(job);
+        // --- NUEVO CÓDIGO DE SELECCIÓN Y MENÚ CONTEXTUAL ---
 
+        // Crear un identificador estable basado en la dirección de memoria del párrafo
+        let ptr_id = para as *const _ as usize;
+        let text_edit_id = ui.id().with(ptr_id);
+        let cache_id = text_edit_id.with("cache");
+
+        // Texto temporal (simula solo lectura ya que se sobreescribe cada frame y rechaza mutaciones persistentes)
+        let mut temp_text = para.text.clone();
+
+        // Layouter personalizado para aplicar el LayoutJob (Rich Text) al TextEdit
+        // [MODIFICACIÓN EGUI 0.34+]: '_text' cambia a '&dyn egui::TextBuffer'
+        let mut layouter = |ui: &egui::Ui, _text: &dyn egui::TextBuffer, wrap_width: f32| {
+            let mut l_job = job.clone();
+            l_job.wrap.max_width = wrap_width;
+            ui.painter().layout_job(l_job)
+        };
+
+        // Dibujar el párrafo como un TextEdit sin marco para permitir selección nativa sin alterar la interfaz
+        let output = egui::TextEdit::multiline(&mut temp_text)
+            .id(text_edit_id)
+            .desired_width(ui.available_width())
+            // [MODIFICACIÓN EGUI 0.34+]: .frame() requiere un egui::Frame en lugar de un booleano
+            .frame(egui::Frame::NONE)
+            .layouter(&mut layouter)
+            .show(ui);
+
+        let response = output.response;
+
+        // Detección de clics secundarios para mantener el rango de selección activo
+        let is_secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
+        let is_secondary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
+        let has_secondary_interaction = (is_secondary_down || is_secondary_pressed) && response.hovered();
+
+        // Guardar en caché el estado de selección en frames normales
+        if let Some(current_range) = output.cursor_range {
+            if !has_secondary_interaction {
+                ui.ctx().data_mut(|d| d.insert_temp(cache_id, current_range));
+            }
+        }
+
+        // Restaurar la selección durante el clic derecho
+        if has_secondary_interaction {
+            if let Some(cached_range) = ui.ctx().data(|d| d.get_temp::<egui::text::CCursorRange>(cache_id)) {
+                let mut state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), text_edit_id)
+                    .unwrap_or_default();
+                state.cursor.set_char_range(Some(cached_range));
+                state.store(ui.ctx(), text_edit_id);
+            }
+        }
+
+        // Lógica de desplazamiento automático
         if is_target {
             if let Some(_target) = pending_scroll_target.take() {
                 response.scroll_to_me(Some(egui::Align::Center));
             }
         }
 
+        // Menú contextual con validación de selección
         response.context_menu(|ui| {
-            if ui.button("📋 Copiar Texto").clicked() {
-                ui.ctx().copy_text(para.text.clone());
+            ui.ctx().memory_mut(|mem| mem.request_focus(text_edit_id));
+            let cached_range: Option<egui::text::CCursorRange> = ui.ctx().data(|d| d.get_temp(cache_id));
+            
+            let has_selection = if let Some(range) = cached_range {
+                range.primary != range.secondary
+            } else {
+                false
+            };
+
+            if has_selection {
+                if ui.button("📋 Copiar").clicked() {
+                    if let Some(range) = cached_range {
+                        let char_range = range.as_sorted_char_range();
+                        
+                        // Extracción segura de caracteres Unicode
+                        let selected_text: String = para.text
+                            .chars()
+                            .skip(char_range.start)
+                            .take(char_range.end - char_range.start)
+                            .collect();
+
+                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                            let _ = clipboard.set_text(selected_text);
+                        }
+                    }
+                    ui.close();
+                }
+            }
+
+            if ui.button("📋 Copiar Todo").clicked() {
+                if let Ok(mut clipboard) = arboard::Clipboard::new() {
+                    let _ = clipboard.set_text(para.text.clone());
+                }
                 ui.close();
             }
         });
