@@ -1,155 +1,188 @@
-use anyhow::{Context, Result};
-use std::{ops::ControlFlow, path::Path};
-use undoc::docx::DocxParser;
-use unpdf::{PageStreamOptions, ParseEvent, PdfParser};
-use crate::models::{CachedDocument, CachedParagraph, StructuralLocation, TextCandidate};
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use std::ops::ControlFlow;
+use unpdf::{PdfParser, ParseEvent, PageStreamOptions};
+use unpdf::model::Block as PdfBlock; // Aliased to prevent conflict with undoc::Block
+use undoc::{docx::DocxParser, Block};
+use crate::models::{TextCandidate, StructuralLocation, CachedDocument, CachedParagraph};
 use crate::search::StructuralSearchEngine;
 
 pub struct DocumentExtractor;
 
 impl DocumentExtractor {
-    pub fn extract_pdf_stream<P: AsRef<Path>>(&self, path: P) -> Result<Vec<TextCandidate>> {
-        let parser = PdfParser::open(path).context("Failed to initialize unpdf parser")?;
-        let candidates_accumulator = std::sync::Mutex::new(Vec::new());
+    /// Extracts text candidates from a PDF document using a streaming parser.
+    /// Utilizes unpdf's native structural preservation to read elements in their logical visual order.
+    pub fn extract_pdf_stream(&self, path: &Path) -> anyhow::Result<Vec<TextCandidate>> {
+        let parser = PdfParser::open(path)?;
+        let candidates_accumulator = Arc::new(Mutex::new(Vec::new()));
+        let candidates_clone = Arc::clone(&candidates_accumulator);
 
-        parser.for_each_page(PageStreamOptions::default(), |event| {
+        parser.for_each_page(PageStreamOptions::default(), move |event| {
             if let ParseEvent::PageParsed(page) = event {
-                let mut page_candidates = Vec::new(); 
+                let mut page_candidates = Vec::new();
                 
-                for (elem_idx, element) in page.elements.iter().enumerate() {
-                    let mut page_text = String::new();
-                    element.append_plain_text(&mut page_text);
-                    
-                    if !page_text.trim().is_empty() {
-                        let raw_text = page_text.clone();
-                        // Relies on the StructuralSearchEngine being moved to search.rs
-                        let (normalized_text, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&raw_text);
+                // unpdf 0.7.0 inherently preserves structure and reading order,
+                // rendering manual spatial/coordinate baseline sorting unnecessary.
+                // Fix: Iterating over `elements` instead of `blocks`
+                for (sorted_idx, block) in page.elements.iter().enumerate() {
+                    let page_text = match block {
+                        PdfBlock::Paragraph(para) => para.plain_text(),
+                        PdfBlock::Table(table) => table.plain_text(),
+                        _ => String::new(),
+                    };
 
+                    let trimmed = page_text.trim();
+                    if !trimmed.is_empty() {
+                        let (normalized, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&page_text);
                         page_candidates.push(TextCandidate {
-                            text: raw_text,
-                            normalized_text,
+                            text: page_text,
+                            normalized_text: normalized,
                             mapping,
-                            location: StructuralLocation::Pdf { 
+                            location: StructuralLocation::Pdf {
                                 page_number: page.number,
-                                block_index: elem_idx,
+                                block_index: sorted_idx,
                             },
                         });
                     }
                 }
 
-                if !page_candidates.is_empty() {
-                    candidates_accumulator.lock().unwrap().extend(page_candidates);
+                if let Ok(mut accumulator) = candidates_clone.lock() {
+                    accumulator.extend(page_candidates);
                 }
             }
             ControlFlow::Continue(())
-        }).context("PDF streaming iteration failed")?;
+        })?;
 
-        Ok(candidates_accumulator.into_inner().unwrap())
+        let result = Arc::try_unwrap(candidates_accumulator)
+           .map_err(|_| anyhow::anyhow!("Arc deallocation failure during PDF candidate collection"))?
+           .into_inner()
+           .map_err(|_| anyhow::anyhow!("Mutex acquisition failure during PDF candidate collection"))?;
+
+        Ok(result)
     }
 
-    pub fn extract_docx<P: AsRef<Path>>(&self, path: P) -> Result<Vec<TextCandidate>> {
-        let mut parser = DocxParser::open(path).context("Failed to initialize OOXML DOCX parser")?;
-        let doc = parser.parse().context("Failed to parse internal document structures")?;
+    /// Extracts text candidates from a DOCX document sequentially.
+    /// Preserves existing architectural bounds and headings context tracking.
+    pub fn extract_docx(&self, path: &Path) -> anyhow::Result<Vec<TextCandidate>> {
+        let doc = DocxParser::open(path)?.parse()?;
         let mut candidates = Vec::new();
+        let mut current_heading = String::new();
+        let mut global_para_count = 0;
 
-        let mut current_heading = String::from("Start of Document");
-        let mut global_para_count = 0; 
-
-        for section in doc.sections.iter() {
-            for block in section.content.iter() {
+        for section in &doc.sections {
+            for block in &section.content {
                 let text = match block {
-                    undoc::Block::Paragraph(para) => para.plain_text(),
-                    undoc::Block::Table(table) => table.plain_text(),
+                    Block::Paragraph(para) => para.plain_text(),
+                    Block::Table(table) => table.plain_text(),
                     _ => String::new(),
                 };
-                
+
                 let trimmed = text.trim();
                 if trimmed.is_empty() {
                     continue;
                 }
 
-                global_para_count += 1;
-
-                let char_count = trimmed.chars().count();
-                if char_count > 2 && char_count < 85 && !trimmed.ends_with('.') && !trimmed.ends_with(':') {
-                    current_heading = trimmed.chars().take(50).collect::<String>();
-                    if char_count > 50 {
-                        current_heading.push_str("...");
-                    }
+                // Track heading contexts dynamically based on specific length and punctuation rules.
+                if trimmed.len() > 2 && trimmed.len() < 85 && !trimmed.ends_with('.') && !trimmed.ends_with(':') {
+                    let char_count = trimmed.chars().count();
+                    current_heading = if char_count > 50 {
+                        let truncated: String = trimmed.chars().take(50).collect();
+                        format!("{}...", truncated)
+                    } else {
+                        trimmed.to_string()
+                    };
                 }
 
-                let raw_text = text.clone();
-                let (normalized_text, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&raw_text);
-
+                let (normalized, mapping) = StructuralSearchEngine::normalize_text_with_mapping(&text);
                 candidates.push(TextCandidate {
-                    text: raw_text,
-                    normalized_text,
+                    text: text.clone(),
+                    normalized_text: normalized,
                     mapping,
-                    location: StructuralLocation::Docx { 
+                    location: StructuralLocation::Docx {
                         global_paragraph_index: global_para_count,
                         heading_context: current_heading.clone(),
                     },
                 });
+
+                global_para_count += 1;
             }
         }
+
         Ok(candidates)
     }
-}
 
-pub fn parse_document_by_type(path: &Path) -> CachedDocument {
-    let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("").to_lowercase();
-    
-    if ext == "pdf" {
-        let mut pages = Vec::new();
-        if let Ok(parser) = PdfParser::open(path) {
-            let _ = parser.for_each_page(PageStreamOptions::default(), |event| {
-                if let ParseEvent::PageParsed(page) = event {
-                    let mut paragraphs = Vec::new();
-                    for (elem_idx, element) in page.elements.iter().enumerate() {
-                        let mut text = String::new();
-                        element.append_plain_text(&mut text);
-                        if !text.trim().is_empty() {
-                            paragraphs.push(CachedParagraph {
+    /// Parses documents into a unified cached structural representation.
+    pub fn parse_document_by_type(&self, path: &Path) -> anyhow::Result<CachedDocument> {
+        let extension = path
+           .extension()
+           .and_then(|ext| ext.to_str())
+           .map(|ext| ext.to_lowercase())
+           .unwrap_or_default();
+
+        match extension.as_str() {
+            "pdf" => {
+                let doc = unpdf::parse_file(path)?;
+                let mut pages = Vec::new();
+
+                for page in &doc.pages {
+                    let mut cached_paragraphs = Vec::new();
+                    
+                    // Utilize unpdf's sequential elements
+                    // Fix: Iterating over `elements` instead of `blocks`
+                    for (sorted_idx, block) in page.elements.iter().enumerate() {
+                        let text = match block {
+                            PdfBlock::Paragraph(para) => para.plain_text(),
+                            PdfBlock::Table(table) => table.plain_text(),
+                            _ => String::new(),
+                        };
+
+                        let trimmed = text.trim();
+                        if !trimmed.is_empty() {
+                            cached_paragraphs.push(CachedParagraph {
                                 text,
-                                original_index: elem_idx, 
+                                original_index: sorted_idx,
                                 is_heading: false,
                                 heading_level: None,
                             });
                         }
                     }
-                    pages.push(paragraphs);
+                    pages.push(cached_paragraphs);
                 }
-                ControlFlow::Continue(())
-            });
-        }
-        CachedDocument::Pdf { pages }
-    } else if ext == "docx" {
-        let mut paragraphs = Vec::new();
-        let mut global_para_count = 0;
-        if let Ok(mut parser) = DocxParser::open(path) {
-            if let Ok(doc) = parser.parse() {
+
+                Ok(CachedDocument::Pdf { pages })
+            }
+            "docx" => {
+                let doc = DocxParser::open(path)?.parse()?;
+                let mut paragraphs = Vec::new();
+                let mut global_para_count = 0;
+
                 for section in &doc.sections {
                     for block in &section.content {
                         let text = match block {
-                            undoc::Block::Paragraph(para) => para.plain_text(),
-                            undoc::Block::Table(table) => table.plain_text(),
+                            Block::Paragraph(para) => para.plain_text(),
+                            Block::Table(table) => table.plain_text(),
                             _ => String::new(),
                         };
-                        if !text.trim().is_empty() {
-                            global_para_count += 1;
-                            paragraphs.push(CachedParagraph {
-                                text,
-                                original_index: global_para_count, 
-                                is_heading: false, 
-                                heading_level: None,
-                            });
+
+                        let trimmed = text.trim();
+                        if trimmed.is_empty() {
+                            continue;
                         }
+
+                        paragraphs.push(CachedParagraph {
+                            text,
+                            original_index: global_para_count,
+                            is_heading: false,
+                            heading_level: None,
+                        });
+
+                        global_para_count += 1;
                     }
                 }
+
+                Ok(CachedDocument::Docx { paragraphs })
             }
+            _ => Ok(CachedDocument::Docx { paragraphs: Vec::new() }),
         }
-        CachedDocument::Docx { paragraphs }
-    } else {
-        CachedDocument::Docx { paragraphs: vec![] }
     }
 }

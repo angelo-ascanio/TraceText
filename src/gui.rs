@@ -2,7 +2,7 @@ use eframe::egui;
 use egui_extras::{Column, TableBuilder, StripBuilder, Size};
 use std::{collections::HashMap, path::PathBuf, sync::{mpsc::{channel, Receiver, Sender}, Arc, RwLock}};
 use crate::app::DisplayRow;
-use crate::extractor::parse_document_by_type;
+use crate::extractor::DocumentExtractor;
 use crate::models::{CachedDocument, CachedParagraph, ParserRequest, ParserResponse, StructuralLocation};
 use crate::palette::{Palette, ThemeMode};
 
@@ -44,7 +44,17 @@ impl TraceTextGui {
                 let doc = match cache_check {
                     Some(cached_doc) => cached_doc,
                     None => {
-                        let parsed_doc = parse_document_by_type(&request.file_path);
+                        // Instantiate the unit struct
+                        let extractor = DocumentExtractor;
+                        
+                        // Call the method and handle the Result gracefully
+                        let parsed_doc = extractor.parse_document_by_type(&request.file_path)
+                            .unwrap_or_else(|e| {
+                                eprintln!("Failed to parse document: {}", e);
+                                // Fallback to an empty document to prevent thread crashes
+                                CachedDocument::Docx { paragraphs: Vec::new() }
+                            });
+
                         let mut w_lock = doc_cache_clone.write().unwrap();
                         w_lock.insert(request.file_path.clone(), parsed_doc.clone());
                         parsed_doc
