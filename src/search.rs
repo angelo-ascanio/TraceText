@@ -36,7 +36,7 @@ impl StructuralSearchEngine {
                     mapping.push(char_idx);
                     last_was_space = true;
                 }
-            } else if!is_punctuation {
+            } else if !is_punctuation {
                 // Canonical Decomposition (NFD) to separate base characters from combining diacritics
                 let decomposed: String = c.to_string().nfd().collect();
                 for dc in decomposed.chars() {
@@ -79,18 +79,29 @@ impl StructuralSearchEngine {
         }
 
         self.candidates
-           .par_iter()
-           .filter_map(|candidate| {
+            .par_iter()
+            .flat_map(|candidate| {
+                let mut matches = Vec::new();
                 let cand_norm = &candidate.normalized_text;
                 if cand_norm.is_empty() {
-                    return None;
+                    return matches;
                 }
 
-                // LAYER 1 & 2: Literal / Normalized Substring Matches
-                if let Some(start_byte_idx) = cand_norm.find(&query_norm) {
+                let c_chars: Vec<char> = cand_norm.chars().collect();
+                let q_chars_count = query_norm.chars().count();
+                let mut found_regions: Vec<(usize, usize)> = Vec::new();
+
+                // Helper to prevent fuzzy matches from duplicating Layer 1 matches
+                let overlaps = |start: usize, end: usize, regions: &[(usize, usize)]| -> bool {
+                    regions.iter().any(|&(s, e)| start <= e && end >= s)
+                };
+
+                // LAYER 1 & 2: Extract ALL Exact/Normalized Matches (No Early Exits)
+                for (start_byte_idx, _) in cand_norm.match_indices(&query_norm) {
                     let start_char_idx = cand_norm[..start_byte_idx].chars().count();
-                    let query_char_count = query_norm.chars().count();
-                    let end_char_idx = start_char_idx + query_char_count - 1;
+                    let end_char_idx = start_char_idx + q_chars_count - 1;
+
+                    found_regions.push((start_char_idx, end_char_idx));
 
                     let mut indices = Vec::new();
                     for i in start_char_idx..=end_char_idx {
@@ -101,14 +112,11 @@ impl StructuralSearchEngine {
 
                     let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
                     
-                    // Assign 100.0 for literal matches, 98.0 for matches requiring normalization
-                    let score = if candidate.text.contains(query.as_str()) {
-                        100.0
-                    } else {
-                        98.0
-                    };
+                    // FIX: Check if the isolated `match_text` is the literal query 
+                    // Using global `.contains()` would falsely score case-insensitive typos as 100 
+                    let score = if match_text == query.as_str() { 100.0 } else { 98.0 };
 
-                    return Some(QueryMatch {
+                    matches.push(QueryMatch {
                         query: query.clone(),
                         matches: true,
                         location: candidate.location.clone(),
@@ -119,35 +127,51 @@ impl StructuralSearchEngine {
                     });
                 }
 
-                // LAYER 3: Blended Fuzzy Matcher
-                let score = Self::compute_fuzzy_score(&query_norm, cand_norm);
-
-                if score >= 60.0 {
-                    let (start_norm, end_norm) = Self::find_best_fuzzy_window(&query_norm, cand_norm);
-
-                    let mut indices = Vec::new();
-                    for i in start_norm..=end_norm {
-                        if i < candidate.mapping.len() {
-                            indices.push(candidate.mapping[i] as u32);
+                // LAYER 3: Blended Fuzzy Matcher (Sliding window to catch typos/acronyms in the remaining file)
+                let mut search_start = 0;
+                while search_start < c_chars.len() {
+                    if let Some((start_norm, end_norm)) = Self::find_best_fuzzy_window_in_range(&query_norm, &c_chars, search_start) {
+                        if overlaps(start_norm, end_norm, &found_regions) {
+                            search_start = end_norm + 1; // Move past overlap
+                            continue;
                         }
+
+                        let window_str: String = c_chars[start_norm..=end_norm].iter().collect();
+                        
+                        // FIX: Score against the extracted `window_str`, NOT the whole file!
+                        let score = Self::compute_fuzzy_score(&query_norm, &window_str);
+
+                        // Slightly lowered threshold to 50.0 to securely catch abbreviations (V&V)
+                        if score >= 50.0 {
+                            found_regions.push((start_norm, end_norm));
+                            
+                            let mut indices = Vec::new();
+                            for i in start_norm..=end_norm {
+                                if i < candidate.mapping.len() {
+                                    indices.push(candidate.mapping[i] as u32);
+                                }
+                            }
+
+                            let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
+
+                            matches.push(QueryMatch {
+                                query: query.clone(),
+                                matches: true,
+                                location: candidate.location.clone(),
+                                similarity_score: score,
+                                prefix,
+                                match_text,
+                                suffix,
+                            });
+                        }
+                        search_start = end_norm + 1;
+                    } else {
+                        break;
                     }
-
-                    let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
-
-                    Some(QueryMatch {
-                        query: query.clone(),
-                        matches: true,
-                        location: candidate.location.clone(),
-                        similarity_score: score,
-                        prefix,
-                        match_text,
-                        suffix,
-                    })
-                } else {
-                    None
                 }
+                matches
             })
-           .collect()
+            .collect()
     }
 
     /// Computes a robust similarity score blending Token Sort, Token Set, and morphological alignment.
@@ -227,37 +251,91 @@ impl StructuralSearchEngine {
         final_raw_score * 95.0
     }
 
-    /// Identifies the optimal sliding window within the candidate text to extract highlighting boundaries.
-    fn find_best_fuzzy_window(query_norm: &str, cand_norm: &str) -> (usize, usize) {
-        let q_chars: Vec<char> = query_norm.chars().collect();
-        let c_chars: Vec<char> = cand_norm.chars().collect();
+    // /// Identifies the optimal sliding window within the candidate text to extract highlighting boundaries.
+    // fn find_best_fuzzy_window(query_norm: &str, cand_norm: &str) -> (usize, usize) {
+    //     let q_chars: Vec<char> = query_norm.chars().collect();
+    //     let c_chars: Vec<char> = cand_norm.chars().collect();
 
-        let q_len = q_chars.len();
+    //     let q_len = q_chars.len();
+    //     let c_len = c_chars.len();
+
+    //     if c_len <= q_len {
+    //         return (0, c_len.saturating_sub(1));
+    //     }
+
+    //     let mut best_score = -1.0;
+    //     let mut best_range = (0, c_len.saturating_sub(1));
+
+    //     // Establish boundaries for sliding window sizing
+    //     let win_min = (q_len as f32 * 0.7) as usize;
+    //     let win_max = (q_len as f32 * 1.4) as usize;
+
+    //     // Perform optimized sliding steps for performance under large strings
+    //     let step = if c_len > 150 { (c_len / 40).max(1) } else { 1 };
+
+    //     for start in (0..c_len).step_by(step) {
+    //         for win_size in win_min..=win_max {
+    //             if start + win_size > c_len {
+    //                 break;
+    //             }
+
+    //             let window_str: String = c_chars[start..(start + win_size)].iter().collect();
+    //             let score = strsim::jaro_winkler(query_norm, &window_str) as f32;
+
+    //             if score > best_score {
+    //                 best_score = score;
+    //                 best_range = (start, start + win_size - 1);
+    //             }
+    //         }
+    //     }
+
+    //     best_range
+    // }
+
+    /// Identifies the optimal sliding window within a localized range to extract highlighting boundaries.
+    fn find_best_fuzzy_window_in_range(query_norm: &str, c_chars: &[char], search_start: usize) -> Option<(usize, usize)> {
+        let q_len = query_norm.chars().count();
         let c_len = c_chars.len();
-
-        if c_len <= q_len {
-            return (0, c_len.saturating_sub(1));
+        
+        if search_start + (q_len as f32 * 0.5) as usize > c_len {
+            return None;
         }
 
-        let mut best_score = -1.0;
-        let mut best_range = (0, c_len.saturating_sub(1));
+        // 1. Fast Hotspot Scan: Stops us from skipping over matches in large files
+        let step = if c_len - search_start > 150 { 3 } else { 1 };
+        let mut hotspot_start = search_start;
+        let mut hotspot_score = -1.0;
 
-        // Establish boundaries for sliding window sizing
+        for start in (search_start..c_len).step_by(step) {
+            if start + q_len > c_len { break; }
+            let window_str: String = c_chars[start..(start + q_len)].iter().collect();
+            let score = strsim::jaro_winkler(query_norm, &window_str) as f32;
+            
+            if score > hotspot_score {
+                hotspot_score = score;
+                hotspot_start = start;
+            }
+        }
+
+        if hotspot_score < 0.4 {
+            return None; // No meaningful similarity nearby
+        }
+
+        // 2. Localized Refinement: Test exact substring lengths around our hotspot
         let win_min = (q_len as f32 * 0.7) as usize;
         let win_max = (q_len as f32 * 1.4) as usize;
+        let search_start_refine = hotspot_start.saturating_sub(q_len / 2).max(search_start);
+        let search_end_refine = (hotspot_start + q_len / 2).min(c_len);
 
-        // Perform optimized sliding steps for performance under large strings
-        let step = if c_len > 150 { (c_len / 40).max(1) } else { 1 };
+        let mut best_score = -1.0;
+        let mut best_range = (0, 0);
 
-        for start in (0..c_len).step_by(step) {
+        for start in search_start_refine..=search_end_refine {
             for win_size in win_min..=win_max {
-                if start + win_size > c_len {
-                    break;
-                }
-
+                if start + win_size > c_len { break; }
                 let window_str: String = c_chars[start..(start + win_size)].iter().collect();
                 let score = strsim::jaro_winkler(query_norm, &window_str) as f32;
-
+                
                 if score > best_score {
                     best_score = score;
                     best_range = (start, start + win_size - 1);
@@ -265,6 +343,10 @@ impl StructuralSearchEngine {
             }
         }
 
-        best_range
+        if best_score > 0.0 {
+            Some(best_range)
+        } else {
+            None
+        }
     }
 }
