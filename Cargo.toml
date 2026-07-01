@@ -1,14 +1,13 @@
 [package]
 name = "TraceText"
-version = "0.1.4"
+version = "0.2.0"
 edition = "2024"
 
 [dependencies]
-unpdf = "0.7.0"
-undoc = "0.5.2"
 anyhow = "1.0.102"
 serde = { version = "1.0.228", features = ["derive"] }
-pdf_oxide = { version = "0.3.69", features = ["default"] }
+libreoffice-pure = "0.4.8"
+pdfium-render = "0.9.2"
 unicode-normalization = "0.1.25"
 unicode-segmentation = "1.13.3"
 aho-corasick = "1.1.4"

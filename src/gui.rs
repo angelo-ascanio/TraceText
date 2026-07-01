@@ -1,10 +1,73 @@
 use eframe::egui;
 use egui_extras::{Column, TableBuilder, StripBuilder, Size};
-use std::{collections::HashMap, path::PathBuf, sync::{mpsc::{channel, Receiver, Sender}, Arc, RwLock}};
+use std::{collections::{HashMap, VecDeque}, path::PathBuf, sync::{mpsc::{channel, Receiver, Sender}, Arc, RwLock}};
+use egui::{ColorImage, TextureHandle, TextureOptions};
 use crate::app::DisplayRow;
 use crate::extractor::DocumentExtractor;
-use crate::models::{CachedDocument, CachedParagraph, ParserRequest, ParserResponse, StructuralLocation};
+use crate::models::{ParserRequest, ParserResponse, BBox};
 use crate::palette::{Palette, ThemeMode};
+
+/// Dynamic cache housing the GPU textures and coordinate configurations for the active document[cite: 106].
+pub struct PageRenderCache {
+    #[allow(dead_code)]
+    pub page_index: usize,
+    pub texture: TextureHandle,
+    pub page_width_points: f32,
+    pub page_height_points: f32,
+}
+
+/// A lightweight LRU cache to manage GPU memory and prevent VRAM exhaustion[cite: 171].
+/// Maintains only the currently viewed page and its immediate neighbors in memory[cite: 174].
+pub struct TextureLruCache {
+    capacity: usize,
+    cache: HashMap<usize, PageRenderCache>,
+    order: VecDeque<usize>, // Tracks access history
+}
+
+impl TextureLruCache {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            cache: HashMap::with_capacity(capacity),
+            order: VecDeque::with_capacity(capacity),
+        }
+    }
+
+    pub fn get(&mut self, page_index: usize) -> Option<&PageRenderCache> {
+        if self.cache.contains_key(&page_index) {
+            // Update access order to mark as most recently used
+            self.order.retain(|&idx| idx != page_index);
+            self.order.push_back(page_index);
+            self.cache.get(&page_index)
+        } else {
+            None
+        }
+    }
+
+    pub fn insert(&mut self, page_index: usize, render_cache: PageRenderCache) {
+        if !self.cache.contains_key(&page_index) {
+            if self.cache.len() >= self.capacity {
+                // Evict the least recently used page texture
+                if let Some(lru_index) = self.order.pop_front() {
+                    // When removed from the HashMap, the TextureHandle is dropped.
+                    // Egui automatically garbage collects the GPU texture[cite: 56, 175].
+                    self.cache.remove(&lru_index);
+                }
+            }
+        } else {
+            self.order.retain(|&idx| idx != page_index);
+        }
+        
+        self.order.push_back(page_index);
+        self.cache.insert(page_index, render_cache);
+    }
+
+    #[allow(dead_code)]
+    pub fn clear(&mut self) {
+        self.cache.clear();
+        self.order.clear();
+    }
+}
 
 pub struct TraceTextGui {
     theme_mode: ThemeMode,
@@ -18,10 +81,13 @@ pub struct TraceTextGui {
     selected_row_index: Option<usize>,
     tx_request: Sender<ParserRequest>,
     rx_response: Receiver<ParserResponse>,
-    doc_cache: Arc<RwLock<HashMap<PathBuf, CachedDocument>>>,
-    active_visualization: Option<ParserResponse>,
-    pending_scroll_target: Option<StructuralLocation>,
-    active_match_text: Option<String>,
+    #[allow(dead_code)]
+    doc_cache: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
+    pub texture_cache: TextureLruCache,
+    pub active_page_index: Option<usize>,
+    pub pending_scroll_target: Option<Vec<BBox>>,
+    #[allow(dead_code)]
+    pub active_match_text: Option<String>,
 }
 
 impl TraceTextGui {
@@ -35,40 +101,90 @@ impl TraceTextGui {
         let egui_ctx = cc.egui_ctx.clone();
 
         std::thread::spawn(move || {
+            use pdfium_render::prelude::*;
+            
+            // 1. Isolate pdfium-render safely inside this background worker.
+            let bindings = Pdfium::bind_to_library(Pdfium::pdfium_platform_library_name_at_path("./"))
+                .or_else(|_| Pdfium::bind_to_system_library())
+                .expect("Critical Error: Failed to bind to local or system Pdfium binaries.");
+            
+            let pdfium = Pdfium::new(bindings);
+            let extractor = DocumentExtractor;
+
             while let Ok(request) = rx_request.recv() {
-                let cache_check = {
-                    let r_lock = doc_cache_clone.read().unwrap();
-                    r_lock.get(&request.file_path).cloned()
-                };
+                match request {
+                    // Phase 2: Ingestion & Spatial Index Generation
+                    ParserRequest::IngestDocument { file_path } => {
+                        let unified_pdf_bytes = match extractor.ingest_to_pdf_bytes(&file_path) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                let _ = tx_response.send(ParserResponse::Error(e.to_string()));
+                                continue;
+                            }
+                        };
 
-                let doc = match cache_check {
-                    Some(cached_doc) => cached_doc,
-                    None => {
-                        // Instantiate the unit struct
-                        let extractor = DocumentExtractor;
-                        
-                        // Call the method and handle the Result gracefully
-                        let parsed_doc = extractor.parse_document_by_type(&request.file_path)
-                            .unwrap_or_else(|e| {
-                                eprintln!("Failed to parse document: {}", e);
-                                // Fallback to an empty document to prevent thread crashes
-                                CachedDocument::Docx { paragraphs: Vec::new() }
-                            });
-
-                        let mut w_lock = doc_cache_clone.write().unwrap();
-                        w_lock.insert(request.file_path.clone(), parsed_doc.clone());
-                        parsed_doc
+                        // Build the SpatialIndex mapping NFD characters to 2D physical bounding boxes
+                        match extractor.build_spatial_index(&pdfium, &unified_pdf_bytes) {
+                            Ok(spatial_index) => {
+                                let mut w_lock = doc_cache_clone.write().unwrap();
+                                w_lock.insert(file_path.clone(), unified_pdf_bytes);
+                                
+                                let _ = tx_response.send(ParserResponse::DocumentIndexed {
+                                    file_path,
+                                    spatial_index,
+                                });
+                                egui_ctx.request_repaint();
+                            }
+                            Err(e) => {
+                                let _ = tx_response.send(ParserResponse::Error(format!("Index mapping failed: {}", e)));
+                            }
+                        }
                     }
-                };
 
-                let response = ParserResponse {
-                    file_path: request.file_path,
-                    document: doc,
-                    target_location: request.target_location,
-                };
+                    // Phase 2: Background Rasterization 
+                    ParserRequest::FetchPage { file_path, page_index, target_width_px } => {
+                        let cache_read = {
+                            let r_lock = doc_cache_clone.read().unwrap();
+                            r_lock.get(&file_path).cloned()
+                        };
 
-                let _ = tx_response.send(response);
-                egui_ctx.request_repaint();
+                        if let Some(pdf_bytes) = cache_read {
+                            if let Ok(document) = pdfium.load_pdf_from_byte_slice(&pdf_bytes, None) {
+                                if let Ok(page) = document.pages().get(page_index as i32) {
+                                    
+                                    let page_width_points = page.width().value;
+                                    let page_height_points = page.height().value;
+                                    
+                                    let aspect_ratio = page_height_points / page_width_points;
+                                    let target_height_px = (target_width_px as f32 * aspect_ratio) as i32;
+
+                                    let render_config = PdfRenderConfig::new()
+                                        .set_target_width(target_width_px)
+                                        .set_maximum_height(target_height_px)
+                                        .render_annotations(true)
+                                        .render_form_data(true);
+
+                                    if let Ok(rendered_page) = page.render_with_config(&render_config) {
+                                        if let Ok(dynamic_image) = rendered_page.as_image() {
+                                            let rgba_image = dynamic_image.into_rgba8();
+                                            
+                                            let _ = tx_response.send(ParserResponse::PageImage {
+                                                file_path,
+                                                page_index,
+                                                width_px: rgba_image.width() as usize,
+                                                height_px: rgba_image.height() as usize,
+                                                rgba_buffer: rgba_image.into_raw(),
+                                                page_width_points,
+                                                page_height_points,
+                                            });
+                                            egui_ctx.request_repaint();
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         });
 
@@ -85,7 +201,8 @@ impl TraceTextGui {
             tx_request,
             rx_response,
             doc_cache,
-            active_visualization: None,
+            texture_cache: TextureLruCache::new(3),
+            active_page_index: None,
             pending_scroll_target: None,
             active_match_text: None,
         }
@@ -145,8 +262,13 @@ impl TraceTextGui {
                     let select_btn = ui.add(egui::Button::new(egui::RichText::new("📁 Seleccionar Documento").color(pal.primary_text)).fill(pal.input_bg));
                     if select_btn.clicked() {
                         if let Some(path) = rfd::FileDialog::new().add_filter("Documentos", &["pdf", "docx"]).pick_file() {
+                            // Send the ingestion request to the background worker
+                            let _ = self.tx_request.send(crate::models::ParserRequest::IngestDocument { 
+                                file_path: path.clone() 
+                            });
+                            
                             self.file_path = Some(path);
-                            self.status_message = "Archivo importado de manera exitosa.".into();
+                            self.status_message = "Archivo importado. Generando índice espacial...".into();
                         }
                     }
 
@@ -404,7 +526,7 @@ impl TraceTextGui {
                                 ui_row.set_selected(is_selected);
                                 let mut row_interacted = false;
                                 
-                                ui_row.col(|ui| { if ui.add(egui::Label::new(&row.query).sense(egui::Sense::click())).clicked() { row_interacted = true; }});
+                                ui_row.col(|ui| { if ui.add(egui::Label::new(format!("Página {}", row.page_number)).sense(egui::Sense::click())).clicked() { row_interacted = true; }});
                                 ui_row.col(|ui| {
                                     if ui.add(egui::Label::new(egui::RichText::new(format!("{:.2}", row.score)).strong()).sense(egui::Sense::click())).clicked() { row_interacted = true; }
                                 });
@@ -431,19 +553,20 @@ impl TraceTextGui {
                                         if ui.add(egui::Label::new(&row.prefix).sense(egui::Sense::click())).clicked() { row_interacted = true; }
                                     }
                                 });
-                                ui_row.col(|ui| { if ui.add(egui::Label::new(&row.location).sense(egui::Sense::click())).clicked() { row_interacted = true; }});
+                                ui_row.col(|ui| { if ui.add(egui::Label::new(format!("Página {}", row.page_number)).sense(egui::Sense::click())).clicked() { row_interacted = true; }});
                                 
                                 if ui_row.response().clicked() || row_interacted {
                                     self.selected_row_index = Some(index);
-                                    if let (Some(path), Some(loc)) = (&self.file_path, &row.raw_location) {
-                                        self.active_match_text = Some(row.match_text.to_string());
-                                        let cached_doc = { self.doc_cache.read().unwrap().get(path).cloned() };
-                                        if let Some(doc) = cached_doc {
-                                            self.pending_scroll_target = Some(loc.clone());
-                                            self.active_visualization = Some(crate::models::ParserResponse { file_path: path.clone(), document: doc, target_location: loc.clone() });
-                                        } else {
-                                            let _ = self.tx_request.send(crate::models::ParserRequest { file_path: path.clone(), target_location: loc.clone() });
-                                        }
+                                    if let Some(path) = &self.file_path {
+                                        // En lugar de guardar una ubicación abstracta, guardamos la página y los BBoxes
+                                        self.pending_scroll_target = Some(row.target_highlights.clone());
+                                        
+                                        // Disparar mensaje al hilo de fondo (background worker) para rasterizar la página específica
+                                        let _ = self.tx_request.send(crate::models::ParserRequest::FetchPage { 
+                                            file_path: path.clone(), 
+                                            page_index: row.page_number, 
+                                            target_width_px: 1600 // Resolución de alta fidelidad para la extracción
+                                        });
                                     }
                                 }
                             });
@@ -460,230 +583,161 @@ impl TraceTextGui {
         ui.separator();
         ui.add_space(4.0);
 
-        // Si no hay visualización activa o texto coincidente, mostrar estado vacío centralizado
-        if self.active_visualization.is_none() || self.active_match_text.is_none() {
+        // Intentar obtener la caché de la página activa desde el LRU Cache
+        let active_page = self.active_page_index;
+        let mut cache_hit = false;
+
+        if let Some(page_idx) = active_page {
+            if let Some(page_cache) = self.texture_cache.get(page_idx) {
+                cache_hit = true;
+
+                egui::ScrollArea::both()
+                    .id_salt("visualizer_canvas_scroll")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        // Determinar el espacio disponible y calcular el tamaño exacto del lienzo
+                        let available_width = ui.available_width();
+                        let aspect_ratio = page_cache.page_height_points / page_cache.page_width_points;
+                        let computed_size = egui::Vec2::new(available_width, available_width * aspect_ratio);
+
+                        // Asignar el lienzo gráfico interactivo
+                        let (rect, _response) = ui.allocate_exact_size(computed_size, egui::Sense::hover());
+
+                        if ui.is_rect_visible(rect) {
+                            let painter = ui.painter_at(rect);
+
+                            // 1. Dibujar la textura base de la página PDF rasterizada
+                            painter.image(
+                                page_cache.texture.id(),
+                                rect,
+                                egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                                egui::Color32::WHITE,
+                            );
+
+                            // 2. Iterar y dibujar las formas de resaltado espacial
+                            if let Some(highlights) = &self.pending_scroll_target {
+                                
+                                // Tonos modernos de alto contraste (naranja corporativo) para destacar coincidencias
+                                let highlight_color = egui::Color32::from_rgba_unmultiplied(242, 107, 33, 110);
+
+                                for pdf_box in highlights {
+                                    // Proyectar coordenadas físicas a coordenadas de pantalla
+                                    let screen_highlight_rect = Self::transform_pdf_to_egui(
+                                        pdf_box,
+                                        page_cache.page_height_points,
+                                        page_cache.page_width_points,
+                                        rect,
+                                    );
+
+                                    // Crear y dibujar el rectángulo translúcido directamente sobre el lienzo
+                                    let highlight_shape = egui::Shape::rect_filled(
+                                        screen_highlight_rect,
+                                        egui::CornerRadius::ZERO,
+                                        highlight_color,
+                                    );
+                                    painter.add(highlight_shape);
+                                }
+
+                                // Auto-scroll inteligente: garantizar que la primera coincidencia esté a la vista
+                                if let Some(first_box) = highlights.first() {
+                                    let focus_rect = Self::transform_pdf_to_egui(
+                                        first_box,
+                                        page_cache.page_height_points,
+                                        page_cache.page_width_points,
+                                        rect,
+                                    );
+                                    ui.scroll_to_rect(focus_rect, Some(egui::Align::Center));
+                                }
+                            }
+                        }
+                    });
+            }
+        }
+
+        // Estado vacío si no hay textura activa en memoria
+        if !cache_hit {
             ui.centered_and_justified(|ui| {
                 ui.label(
-                    egui::RichText::new("Seleccione una fila en la tabla para inspeccionar su contexto estructurado.")
+                    egui::RichText::new("Seleccione una fila en la tabla para cargar y renderizar el lienzo visual.")
                         .italics()
                         .color(pal.subdued_text)
                         .size(14.0)
                 );
             });
-            return;
         }
-
-        // Extraer de forma segura las referencias requeridas para el renderizado
-        let visual_data = self.active_visualization.as_ref().unwrap();
-        let match_text = self.active_match_text.as_ref().unwrap();
-        let pending_scroll = &mut self.pending_scroll_target;
-
-        egui::ScrollArea::vertical()
-            .id_salt("visualizer_scroll")
-            .auto_shrink([false, false])
-            .show(ui, |ui| {
-                match &visual_data.document {
-                    CachedDocument::Pdf { pages } => {
-                        for (p_idx, paragraphs) in pages.iter().enumerate() {
-                            for para in paragraphs {
-                                let is_target = match &visual_data.target_location {
-                                    StructuralLocation::Pdf { page_number, block_index } => {
-                                        *page_number as usize == p_idx + 1 && *block_index == para.original_index
-                                    },
-                                    _ => false,
-                                };
-                                
-                                Self::render_paragraph(ui, para, is_target, match_text, pending_scroll, pal);
-                            }
-                        }
-                    },
-                    CachedDocument::Docx { paragraphs } => {
-                        for para in paragraphs {
-                            let is_target = match &visual_data.target_location {
-                                StructuralLocation::Docx { global_paragraph_index, .. } => {
-                                    *global_paragraph_index == para.original_index
-                                },
-                                _ => false,
-                            };
-                            
-                            Self::render_paragraph(ui, para, is_target, match_text, pending_scroll, pal);
-                        }
-                    }
-                }
-            });
     }
 
-    fn render_paragraph(
-        ui: &mut egui::Ui, 
-        para: &CachedParagraph, 
-        is_target: bool, 
-        match_text: &str,
-        pending_scroll_target: &mut Option<StructuralLocation>,
-        pal: &Palette
-    ) {
-        use egui::text::{LayoutJob, TextFormat};
-        use egui::FontId;
+    /// Proyecta una caja delimitadora física (PostScript) a coordenadas lógicas de pantalla en Egui.
+    fn transform_pdf_to_egui(
+        pdf_box: &BBox,
+        pdf_page_height: f32,
+        pdf_page_width: f32,
+        ui_rect: egui::Rect,
+    ) -> egui::Rect {
+        let scale_x = ui_rect.width() / pdf_page_width;
+        let scale_y = ui_rect.height() / pdf_page_height;
 
-        let mut job = LayoutJob::default();
-        job.break_on_newline = true;
-        job.wrap.max_width = ui.available_width();
-        
-        let normal_format = TextFormat {
-            font_id: FontId::proportional(14.0),
-            color: pal.primary_text,
-            ..Default::default()
-        };
+        // La proyección en X es lineal
+        let egui_left = ui_rect.min.x + (pdf_box.left * scale_x);
+        let egui_right = ui_rect.min.x + (pdf_box.right * scale_x);
 
-        if para.is_heading {
-            let h_size = match para.heading_level {
-                Some(lvl) => (18.0 - (lvl as f32) * 1.5).max(14.0),
-                None => 16.0,
-            };
-            let mut heading_format = TextFormat {
-                font_id: FontId::proportional(h_size),
-                color: pal.strong_text,
-                ..Default::default()
-            };
-            
-            if is_target {
-                heading_format.background = pal.match_bg;
-                heading_format.color = pal.match_fg;
-            }
-            job.append(&para.text, 0.0, heading_format);
-            
-        } else if is_target {
-            let highlight_format = TextFormat {
-                font_id: FontId::proportional(14.0),
-                color: pal.match_fg,
-                background: pal.match_bg,
-                expand_bg: 1.5,
-                ..Default::default()
-            };
+        // La proyección en Y debe invertirse: el origen PostScript es inferior-izquierdo, egui es superior-izquierdo
+        let egui_top = ui_rect.min.y + ((pdf_page_height - pdf_box.top) * scale_y);
+        let egui_bottom = ui_rect.min.y + ((pdf_page_height - pdf_box.bottom) * scale_y);
 
-            if let Some(start_idx) = para.text.to_lowercase().find(&match_text.to_lowercase()) {
-                let end_idx = start_idx + match_text.len();
-
-                let head = &para.text[0..start_idx];
-                let matched_sub = &para.text[start_idx..end_idx];
-                let tail = &para.text[end_idx..];
-
-                job.append(head, 0.0, normal_format.clone());
-                job.append(matched_sub, 0.0, highlight_format);
-                job.append(tail, 0.0, normal_format);
-            } else {
-                job.append(&para.text, 0.0, highlight_format);
-            }
-        } else {
-            job.append(&para.text, 0.0, normal_format);
-        }
-
-        // --- NUEVO CÓDIGO DE SELECCIÓN Y MENÚ CONTEXTUAL ---
-
-        // Crear un identificador estable basado en la dirección de memoria del párrafo
-        let ptr_id = para as *const _ as usize;
-        let text_edit_id = ui.id().with(ptr_id);
-        let cache_id = text_edit_id.with("cache");
-
-        // Texto temporal (simula solo lectura ya que se sobreescribe cada frame y rechaza mutaciones persistentes)
-        let mut temp_text = para.text.clone();
-
-        // Layouter personalizado para aplicar el LayoutJob (Rich Text) al TextEdit
-        // [MODIFICACIÓN EGUI 0.34+]: '_text' cambia a '&dyn egui::TextBuffer'
-        let mut layouter = |ui: &egui::Ui, _text: &dyn egui::TextBuffer, wrap_width: f32| {
-            let mut l_job = job.clone();
-            l_job.wrap.max_width = wrap_width;
-            ui.painter().layout_job(l_job)
-        };
-
-        // Dibujar el párrafo como un TextEdit sin marco para permitir selección nativa sin alterar la interfaz
-        let output = egui::TextEdit::multiline(&mut temp_text)
-            .id(text_edit_id)
-            .desired_width(ui.available_width())
-            // [MODIFICACIÓN EGUI 0.34+]: .frame() requiere un egui::Frame en lugar de un booleano
-            .frame(egui::Frame::NONE)
-            .layouter(&mut layouter)
-            .show(ui);
-
-        let response = output.response;
-
-        // Detección de clics secundarios para mantener el rango de selección activo
-        let is_secondary_down = ui.input(|i| i.pointer.button_down(egui::PointerButton::Secondary));
-        let is_secondary_pressed = ui.input(|i| i.pointer.button_pressed(egui::PointerButton::Secondary));
-        let has_secondary_interaction = (is_secondary_down || is_secondary_pressed) && response.hovered();
-
-        // Guardar en caché el estado de selección en frames normales
-        if let Some(current_range) = output.cursor_range {
-            if !has_secondary_interaction {
-                ui.ctx().data_mut(|d| d.insert_temp(cache_id, current_range));
-            }
-        }
-
-        // Restaurar la selección durante el clic derecho
-        if has_secondary_interaction {
-            if let Some(cached_range) = ui.ctx().data(|d| d.get_temp::<egui::text::CCursorRange>(cache_id)) {
-                let mut state = egui::widgets::text_edit::TextEditState::load(ui.ctx(), text_edit_id)
-                    .unwrap_or_default();
-                state.cursor.set_char_range(Some(cached_range));
-                state.store(ui.ctx(), text_edit_id);
-            }
-        }
-
-        // Lógica de desplazamiento automático
-        if is_target {
-            if let Some(_target) = pending_scroll_target.take() {
-                response.scroll_to_me(Some(egui::Align::Center));
-            }
-        }
-
-        // Menú contextual con validación de selección
-        response.context_menu(|ui| {
-            ui.ctx().memory_mut(|mem| mem.request_focus(text_edit_id));
-            let cached_range: Option<egui::text::CCursorRange> = ui.ctx().data(|d| d.get_temp(cache_id));
-            
-            let has_selection = if let Some(range) = cached_range {
-                range.primary != range.secondary
-            } else {
-                false
-            };
-
-            if has_selection {
-                if ui.button("📋 Copiar").clicked() {
-                    if let Some(range) = cached_range {
-                        let char_range = range.as_sorted_char_range();
-                        
-                        // Extracción segura de caracteres Unicode
-                        let selected_text: String = para.text
-                            .chars()
-                            .skip(char_range.start)
-                            .take(char_range.end - char_range.start)
-                            .collect();
-
-                        if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                            let _ = clipboard.set_text(selected_text);
-                        }
-                    }
-                    ui.close();
-                }
-            }
-
-            if ui.button("📋 Copiar Todo").clicked() {
-                if let Ok(mut clipboard) = arboard::Clipboard::new() {
-                    let _ = clipboard.set_text(para.text.clone());
-                }
-                ui.close();
-            }
-        });
-
-        ui.add_space(8.0);
+        egui::Rect::from_min_max(
+            egui::pos2(egui_left, egui_top),
+            egui::pos2(egui_right, egui_bottom),
+        )
     }
+
 }
 
 impl eframe::App for TraceTextGui {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // Channel receiver integration loop
-        if let Ok(response) = self.rx_response.try_recv() {
-            self.pending_scroll_target = Some(response.target_location.clone());
-            self.active_visualization = Some(response);
+        while let Ok(response) = self.rx_response.try_recv() {
+            match response {
+                ParserResponse::PageImage {
+                    file_path: _,
+                    page_index,
+                    rgba_buffer,
+                    width_px,
+                    height_px,
+                    page_width_points,
+                    page_height_points,
+                } => {
+                    // Convert the raw RGBA buffer into an egui-compatible ColorImage [cite: 115, 173]
+                    let size = [width_px, height_px];
+                    let color_image = ColorImage::from_rgba_unmultiplied(size, &rgba_buffer); //[cite: 116];
+
+                    // Allocate the texture to GPU memory [cite: 117]
+                    let texture = ui.ctx().load_texture(
+                        format!("pdf_page_cache_{}", page_index),
+                        color_image,
+                        TextureOptions::LINEAR,
+                    );
+
+                    // Package into the cache structure
+                    let render_cache = PageRenderCache {
+                        page_index,
+                        texture,
+                        page_width_points,
+                        page_height_points,
+                    };
+
+                    // Insert into LRU Cache. Drops older textures automatically.
+                    self.texture_cache.insert(page_index, render_cache);
+                    self.active_page_index = Some(page_index);
+                }
+                ParserResponse::DocumentIndexed { file_path: _, spatial_index: _ } => {
+                    // Handle indexing completion (Phase 2/3)
+                    self.status_message = "Indexación espacial completada. Listo para búsqueda.".into();
+                }
+                ParserResponse::Error(err) => {
+                    self.status_message = format!("Error del motor: {}", err);
+                }
+            }
         }
 
         // Configure layout themes and pull current active color maps

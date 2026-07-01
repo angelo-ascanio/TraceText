@@ -119,11 +119,11 @@ impl StructuralSearchEngine {
                     matches.push(QueryMatch {
                         query: query.clone(),
                         matches: true,
-                        location: candidate.location.clone(),
                         similarity_score: score,
                         prefix,
                         match_text,
                         suffix,
+                        matched_indices: indices.clone(),
                     });
                 }
 
@@ -153,15 +153,16 @@ impl StructuralSearchEngine {
                             }
 
                             let (prefix, match_text, suffix) = resolve_highlight(&candidate.text, &indices);
+                            let score = if match_text == query.as_str() { 100.0 } else { 98.0 };
 
                             matches.push(QueryMatch {
                                 query: query.clone(),
                                 matches: true,
-                                location: candidate.location.clone(),
                                 similarity_score: score,
                                 prefix,
                                 match_text,
                                 suffix,
+                                matched_indices: indices.clone(),
                             });
                         }
                         search_start = end_norm + 1;

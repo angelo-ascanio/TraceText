@@ -2,9 +2,9 @@ use anyhow::{Context, Result};
 use compact_str::CompactString;
 use std::{collections::HashMap, path::Path};
 use crate::extractor::DocumentExtractor;
-use crate::models::{QueryMatch, StructuralLocation};
+use crate::models::{QueryMatch, SpatialIndex, BBox};
 use crate::search::StructuralSearchEngine;
-use crate::utils::apply_buffer;
+use crate::utils::{apply_buffer, resolve_spatial_highlights};
 
 #[derive(Clone)]
 pub struct DisplayRow {
@@ -13,8 +13,8 @@ pub struct DisplayRow {
     pub prefix: String,
     pub match_text: String,
     pub suffix: String,
-    pub location: String,
-    pub raw_location: Option<StructuralLocation>,
+    pub page_number: usize,           
+    pub target_highlights: Vec<BBox>, 
 }
 
 impl DisplayRow {
@@ -41,9 +41,9 @@ impl TraceTextApp {
         let ext = file_path.extension().and_then(|e| e.to_str())
             .context("Input file lacks a valid extension")?.to_lowercase();
             
-        let candidates = match ext.as_str() {
-            "pdf" => extractor.extract_pdf_stream(file_path)?,
-            "docx" => extractor.extract_docx(file_path)?,
+        // Phase 1 integration: Unifying the pipeline to output candidates and the SpatialIndex
+        let (candidates, spatial_index) = match ext.as_str() {
+            "pdf" | "docx" => extractor.extract_unified_pipeline(file_path)?,
             _ => anyhow::bail!("Unsupported file format: {}", ext),
         };
 
@@ -55,13 +55,20 @@ impl TraceTextApp {
             .filter(|m| m.similarity_score >= threshold)
             .collect();
 
-        // Pass buffer_size down to the aggregate function
-        Ok(Self::aggregate_results(&queries, &successful_matches, buffer_size, display_limit))
+        // Pass down the SpatialIndex to resolve physical coordinates
+        Ok(Self::aggregate_results(
+            &queries, 
+            &successful_matches, 
+            &spatial_index, 
+            buffer_size, 
+            display_limit
+        ))
     }
 
     fn aggregate_results(
         all_queries: &[CompactString], 
         matches: &[QueryMatch], 
+        spatial_index: &SpatialIndex,
         buffer_size: usize, 
         display_limit: usize
     ) -> Vec<DisplayRow> {
@@ -72,24 +79,19 @@ impl TraceTextApp {
         for query in all_queries {
             if let Some(query_matches) = match_map.get(query) {
                 for m in query_matches {
-                    let location_str = match &m.location {
-                        StructuralLocation::Pdf { page_number, block_index } => {
-                            format!("Page {} (Block {})", page_number, block_index)
-                        },
-                        StructuralLocation::Docx { global_paragraph_index, heading_context } => {
-                            format!("Heading: \"{}\" (Paragraph {})", heading_context, global_paragraph_index)
-                        },
-                    };
-                    
+                    // Resolve the physical layout metrics using the spatial index
+                    let (page_number, target_highlights) = resolve_spatial_highlights(
+                        &m.matched_indices, 
+                        spatial_index
+                    );
+
                     let prefix_clean = m.prefix.replace('\n', " ");
                     let match_clean = m.match_text.replace('\n', " ");
                     let suffix_clean = m.suffix.replace('\n', " ");
 
-                    // 1. Apply the standard buffer size extraction using the util function
                     let mut final_prefix = apply_buffer(&prefix_clean, buffer_size, true).to_string();
                     let mut final_suffix = apply_buffer(&suffix_clean, buffer_size, false).to_string();
 
-                    // 2. Enforce the strict UI display limit, re-applying the buffer if necessary 
                     let match_len = match_clean.chars().count();
                     let total_len = final_prefix.chars().count() + match_len + final_suffix.chars().count();
                     
@@ -97,7 +99,6 @@ impl TraceTextApp {
                         let available = display_limit.saturating_sub(match_len);
                         let half = available / 2;
                         
-                        // We run apply_buffer against the original cleaned strings to avoid double ellipses ("......")
                         final_prefix = apply_buffer(&prefix_clean, half, true).to_string();
                         final_suffix = apply_buffer(&suffix_clean, half, false).to_string();
                     }
@@ -108,8 +109,8 @@ impl TraceTextApp {
                         prefix: final_prefix,
                         match_text: match_clean,
                         suffix: final_suffix,
-                        location: location_str,
-                        raw_location: Some(m.location.clone()),
+                        page_number,
+                        target_highlights,
                     });
                 }
             } else {
@@ -119,8 +120,8 @@ impl TraceTextApp {
                     prefix: "N/A".to_string(),
                     match_text: "".to_string(),
                     suffix: "".to_string(),
-                    location: "N/A".to_string(),
-                    raw_location: None,
+                    page_number: 0,
+                    target_highlights: vec![],
                 });
             }
         }
